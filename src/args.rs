@@ -47,7 +47,7 @@ pub struct Options {
     pub size: Option<(u32, u32)>,
     pub cursor: bool,
     pub cfr: bool,
-    pub dxgi: bool,
+    pub capture: CaptureMethod,
     pub gop_seconds: f64,
     pub ram_limit_mb: Option<u32>,
     pub hotkey_save: String,
@@ -56,6 +56,16 @@ pub struct Options {
     pub duration: Option<f64>,
     pub adapter: Option<u32>,
     pub verbose: bool,
+}
+
+/// How to capture. `Auto` uses NvFBC for screens when the driver allows it, otherwise Windows
+/// Graphics Capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureMethod {
+    Auto,
+    Nvfbc,
+    Wgc,
+    Dxgi,
 }
 
 impl Default for Options {
@@ -72,7 +82,7 @@ impl Default for Options {
             size: None,
             cursor: true,
             cfr: true,
-            dxgi: false,
+            capture: CaptureMethod::Auto,
             gop_seconds: 1.0,
             ram_limit_mb: None,
             hotkey_save: "ctrl+alt+f10".into(),
@@ -92,6 +102,9 @@ pub enum Command {
     ListCaptureOptions,
     ListAudio,
     ListEncoders,
+    NvfbcStatus,
+    /// Switch NvFBC on or off in the driver (administrator).
+    NvfbcEnable(bool),
     Help,
     Version,
 }
@@ -164,6 +177,9 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         Some("--list-capture-options") => return Ok(Command::ListCaptureOptions),
         Some("--list-audio-devices") | Some("--list-application-audio") => return Ok(Command::ListAudio),
         Some("--list-encoders") | Some("--info") => return Ok(Command::ListEncoders),
+        Some("--nvfbc-status") => return Ok(Command::NvfbcStatus),
+        Some("--nvfbc-enable") => return Ok(Command::NvfbcEnable(true)),
+        Some("--nvfbc-disable") => return Ok(Command::NvfbcEnable(false)),
         Some("-h") | Some("--help") | None => return Ok(Command::Help),
         Some("--version") => return Ok(Command::Version),
         _ => {}
@@ -256,10 +272,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 }
             }
             "-capture" => {
-                o.dxgi = match val()? {
-                    "wgc" => false,
-                    "dxgi" => true,
-                    v => return Err(format!("-capture: `{v}` (wgc or dxgi)")),
+                o.capture = match val()? {
+                    "auto" => CaptureMethod::Auto,
+                    "nvfbc" => CaptureMethod::Nvfbc,
+                    "wgc" => CaptureMethod::Wgc,
+                    "dxgi" => CaptureMethod::Dxgi,
+                    v => return Err(format!("-capture: `{v}` (auto, nvfbc, wgc or dxgi)")),
                 }
             }
             "-gop" => {
@@ -335,7 +353,7 @@ mod tests {
         };
         assert_eq!(o.window, Window::Title("Notepad".into()));
         assert_eq!(o.size, Some((1280, 720)));
-        assert!(!o.cursor && !o.cfr && o.dxgi);
+        assert!(!o.cursor && !o.cfr && o.capture == CaptureMethod::Dxgi);
         assert_eq!(o.duration, Some(5.0));
         let Command::Run(o) = p("-w hwnd:0x1A2B -o x.mp4").unwrap() else { panic!() };
         assert_eq!(o.window, Window::Handle(0x1a2b));

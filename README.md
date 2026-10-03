@@ -10,7 +10,7 @@ A ShadowPlay-style replay buffer and screen recorder for Windows: it keeps the l
 
 - **Replay buffer:** the last `-r` seconds held in RAM as encoded packets, evicted a whole group of pictures at a time, so every saved clip starts on a keyframe and decodes. Saving copies references, not data, and writes on its own thread (20 s of 1080p60 HEVC in 7 ms here, into the file cache).
 - **Recording:** straight to a file (`-o FILE`), or toggled on and off while the replay buffer runs.
-- **Capture:** Windows Graphics Capture of a screen or one window (by title, handle or the focused one), or DXGI Desktop Duplication. No hooks into the captured program.
+- **Capture:** NVIDIA's NvFBC for screens on NVIDIA GPUs (see below), Windows Graphics Capture of a screen or one window (by title, handle or the focused one), or DXGI Desktop Duplication. No hooks into the captured program.
 - **GPU pipeline:** the captured texture is converted to NV12 by a compute shader (BT.709, limited range, scaled to the output size) and handed to the encoder through a DXGI device manager. No frame is copied to system memory.
 - **Hardware encoding** through the GPU vendor's Media Foundation encoder (NVENC on NVIDIA, AMF on AMD, Quick Sync on Intel): H.264, HEVC and AV1, CBR, VBR or constant quality, constant or variable frame rate.
 - **Audio tracks:** desktop audio (loopback), the default microphone, and any program by name or pid (`app:game.exe`, with its child processes) through Windows' process loopback. Each is a separate AAC track, kept continuous with silence when nothing plays.
@@ -53,7 +53,7 @@ rbuf --list-encoders                                                         # G
 | `-s WxH` | Output size (default: the captured size). |
 | `-cursor yes\|no`, `-fm cfr\|vfr` | Capture the cursor; constant or variable frame rate (cfr repeats the last frame when nothing changed). |
 | `-gop SECONDS` | Keyframe interval (default 1): how close to the asked length a clip starts. |
-| `-capture wgc\|dxgi` | Windows Graphics Capture (default) or DXGI Desktop Duplication (screens only, no cursor). |
+| `-capture auto\|nvfbc\|wgc\|dxgi` | `auto` (default) tries NvFBC for a screen and falls back to Windows Graphics Capture, saying why. `dxgi` is DXGI Desktop Duplication (screens only, no cursor). |
 | `-ram-limit MB` | Cap the replay buffer's memory; whole groups of pictures are dropped to stay under it. |
 | `-hotkey-save KEYS`, `-hotkey-record KEYS` | For example `alt+f10`. The defaults avoid ShadowPlay's Alt+F10 and Alt+F9; a key another program holds is reported and the commands still work. |
 | `-t SECONDS`, `-gpu N`, `-v yes` | Stop after a time; use another adapter; print frame statistics every second. |
@@ -61,6 +61,16 @@ rbuf --list-encoders                                                         # G
 Options from gpu-screen-recorder that rbuf does not have: merged audio sources (`-a "a|b"`), containers other than MP4, portal capture and the Linux-only ones.
 
 ![vmeta on a saved clip: HEVC 1920x1080 60 fps, 1,251 frames, and two 48 kHz AAC tracks](docs/images/clip.png)
+
+## NvFBC
+
+NvFBC (NVIDIA Frame Buffer Capture) is the driver-level capture ShadowPlay was built on: the driver copies the display's frame buffer into GPU memory without the Desktop Window Manager or DXGI. rbuf uses its CUDA interface: each frame lands in CUDA memory, CUDA copies it into a Direct3D 11 texture registered for interop, and from there it takes the same path as the other capture methods. Both `NvFBC64.dll` and `nvcuda.dll` are loaded at run time, so machines without them simply fall back.
+
+- **GeForce cards:** the driver only grants NvFBC sessions to callers that pass a private-data key. rbuf passes the key NVIDIA's own GeForce software uses (documented publicly by the nvidia-patch project). Nothing in the driver is patched.
+- **The driver switch:** `rbuf --nvfbc-enable` (as administrator) calls the driver's `NvFBC_Enable`, which sets `NVFBCEnable` for the driver; it takes effect after the display driver restarts. `rbuf --nvfbc-disable` undoes it. `rbuf --nvfbc-status` shows what the driver answers for each interface, with and without the key.
+- **One client at a time:** while NVIDIA's own Instant Replay is running, its helper (`nvsphelper64.exe`) holds NvFBC.
+
+**Tested state:** on the development machine (RTX 5070 Ti, driver 610.88, Windows 11 23H2) the driver refused every session with "driver failure", with and without the key, with Instant Replay's helper stopped and with NvFBC enabled before a driver restart. Whether the restart fixes it has not been checked yet, so `auto` currently ends in Windows Graphics Capture on that machine. NVIDIA lists NvFBC on Windows as deprecated, and some drivers may no longer serve it at all.
 
 ## How it works
 
@@ -110,6 +120,7 @@ Audio and video sync: `examples/sync.rs` flashes its window and plays a click in
 - Only NVIDIA was tested. AMD's and Intel's Media Foundation encoders are reached through the same code but have never run it. The compute shader needs typed UAV stores on NV12 (Direct3D 11.3); a GPU without them is refused with a message, there is no fallback yet.
 - Encoding goes through the vendors' Media Foundation transforms, not the NVENC or AMF SDKs directly, so options only the SDKs expose (lookahead, AQ, two-pass) are not available.
 - 8-bit SDR only: no HDR or 10-bit capture.
+- NvFBC captures whole screens only, and has not yet produced a frame on the one test machine (see NvFBC above).
 - Audio is 48 kHz stereo AAC at 192 kbit/s; surround is mixed down by Windows. Sources are separate tracks; mixing them into one is not supported.
 - A window that changes size is scaled to the size the recording started with.
 - `app:` needs the program to be running when rbuf starts.

@@ -1,5 +1,6 @@
-//! Screen and window capture into a GPU texture: Windows Graphics Capture (monitors and windows,
-//! the default) or DXGI Desktop Duplication (monitors). Either way the newest frame is copied into
+//! Screen and window capture into a GPU texture: NVIDIA's NvFBC (monitors, on NVIDIA GPUs; see
+//! `nvfbc`), Windows Graphics Capture (monitors and windows) or DXGI Desktop Duplication
+//! (monitors). Whichever is used, the newest frame is copied into
 //! one texture owned here, with its timestamp; the pacer reads it at the output frame rate. No
 //! hooking into the captured program, so nothing an anti-cheat would see.
 
@@ -89,6 +90,7 @@ pub enum Target {
 pub enum Method {
     Wgc,
     Dxgi,
+    Nvfbc,
 }
 
 /// The newest captured frame.
@@ -110,9 +112,10 @@ pub struct Capture {
     pub size: (u32, u32),
     _wgc: Option<(GraphicsCaptureSession, Direct3D11CaptureFramePool, GraphicsCaptureItem)>,
     dxgi: Option<(Arc<std::sync::atomic::AtomicBool>, JoinHandle<()>)>,
+    _nvfbc: Option<super::nvfbc::NvfbcCapture>,
 }
 
-fn copy_into(gpu: &Gpu, latest: &Mutex<Latest>, src: &ID3D11Texture2D, content: (u32, u32), time: i64) {
+pub(super) fn copy_into(gpu: &Gpu, latest: &Mutex<Latest>, src: &ID3D11Texture2D, content: (u32, u32), time: i64) {
     let (w, h) = texture_size(src);
     let content = (content.0.min(w).max(1), content.1.min(h).max(1));
     let mut l = latest.lock().unwrap();
@@ -144,6 +147,15 @@ impl Capture {
             m.map(|m| HMONITOR(m.handle as *mut _))
                 .ok_or_else(|| windows::core::Error::new(windows::core::HRESULT(-1), "no such monitor"))
         };
+        if method == Method::Nvfbc {
+            let Target::Monitor(i) = target else {
+                return Err(windows::core::Error::new(windows::core::HRESULT(-1), "NvFBC captures monitors only"));
+            };
+            let ordinal = output_ordinal(monitor(*i)?);
+            let n = super::nvfbc::NvfbcCapture::start(gpu, ordinal, cursor, latest.clone())
+                .map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e))?;
+            return Ok(Capture { latest, size: n.size, _wgc: None, dxgi: None, _nvfbc: Some(n) });
+        }
         if method == Method::Dxgi {
             let Target::Monitor(i) = target else {
                 return Err(windows::core::Error::new(windows::core::HRESULT(-1), "desktop duplication captures monitors only"));
@@ -188,7 +200,13 @@ impl Capture {
         // Windows 11 can leave out the yellow border.
         let _ = session.SetIsBorderRequired(false);
         session.StartCapture()?;
-        Ok(Capture { latest, size: (size.Width as u32, size.Height as u32), _wgc: Some((session, pool, item)), dxgi: None })
+        Ok(Capture {
+            latest,
+            size: (size.Width as u32, size.Height as u32),
+            _wgc: Some((session, pool, item)),
+            dxgi: None,
+            _nvfbc: None,
+        })
     }
 
     fn start_dxgi(gpu: &Gpu, mon: HMONITOR, latest: Arc<Mutex<Latest>>) -> Result<Capture> {
@@ -241,9 +259,33 @@ impl Capture {
                     }
                 }
             });
-            Ok(Capture { latest, size, _wgc: None, dxgi: Some((stop, handle)) })
+            Ok(Capture { latest, size, _wgc: None, dxgi: Some((stop, handle)), _nvfbc: None })
         }
     }
+}
+
+/// The display's position in DXGI's enumeration of outputs over all adapters, which is the
+/// adapter ordinal NvFBC expects (0 is the primary display).
+fn output_ordinal(mon: HMONITOR) -> u32 {
+    let Ok(f) =
+        (unsafe { windows::Win32::Graphics::Dxgi::CreateDXGIFactory1::<windows::Win32::Graphics::Dxgi::IDXGIFactory1>() })
+    else {
+        return 0;
+    };
+    let mut n = 0;
+    let mut a = 0;
+    while let Ok(adapter) = unsafe { f.EnumAdapters1(a) } {
+        let mut o = 0;
+        while let Ok(out) = unsafe { adapter.EnumOutputs(o) } {
+            if unsafe { out.GetDesc() }.map(|d| d.Monitor == mon).unwrap_or(false) {
+                return n;
+            }
+            n += 1;
+            o += 1;
+        }
+        a += 1;
+    }
+    0
 }
 
 /// The WinRT Direct3D device wrapper is agile, so the free-threaded frame pool may use it from its

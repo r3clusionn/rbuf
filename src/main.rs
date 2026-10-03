@@ -10,6 +10,7 @@ usage:
   rbuf -w screen -f 60 -a default_output -o FILE.mp4          record until Ctrl+C (or -t SECONDS)
   rbuf save | record | stop                                   control a running replay buffer
   rbuf --list-capture-options | --list-application-audio | --list-encoders
+  rbuf --nvfbc-status | --nvfbc-enable | --nvfbc-disable           NvFBC state (enable/disable need administrator)
 
 options (as in gpu-screen-recorder):
   -w screen|screen:N|focused|window:TITLE|hwnd:0xHANDLE   what to capture (default screen: the primary monitor)
@@ -25,7 +26,8 @@ options (as in gpu-screen-recorder):
   -cursor yes|no     capture the mouse cursor (default yes)
   -fm cfr|vfr        constant or variable frame rate (default cfr)
   -gop SECONDS       keyframe interval, the precision of a saved clip's start (default 1)
-  -capture wgc|dxgi  Windows Graphics Capture (default) or DXGI Desktop Duplication (screens only)
+  -capture auto|nvfbc|wgc|dxgi  auto (default): NvFBC for screens on NVIDIA GPUs, else Windows Graphics Capture;
+                     dxgi is DXGI Desktop Duplication (screens only)
   -ram-limit MB      cap the replay buffer's memory
   -hotkey-save KEYS  default ctrl+alt+f10 (ShadowPlay uses alt+f10)
   -hotkey-record KEYS  default ctrl+alt+f9
@@ -102,6 +104,15 @@ fn run(cmd: Command) -> Result<(), String> {
             for e in list {
                 println!("  {:<5} {}", format!("{:?}", e.codec).to_lowercase(), e.name);
             }
+        }
+        Command::NvfbcStatus => {
+            for line in rbuf::win::nvfbc::probe() {
+                println!("{line}");
+            }
+        }
+        Command::NvfbcEnable(on) => {
+            rbuf::win::nvfbc::enable(on).map_err(|e| format!("{e} (run as administrator)"))?;
+            println!("NvFBC {} in the driver", if on { "enabled" } else { "disabled" });
         }
         Command::Run(o) => recorder::run(o)?,
     }

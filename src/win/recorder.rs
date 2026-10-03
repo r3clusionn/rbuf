@@ -146,7 +146,9 @@ impl Recording {
             }
             self.start = Some(p.pts);
         }
-        let Some(start) = self.start else { return Ok(()) };
+        let Some(start) = self.start else {
+            return Ok(());
+        };
         if p.pts < start || p.pts <= self.last[stream] {
             return Ok(());
         }
@@ -209,6 +211,27 @@ fn codec_label(c: VideoCodec) -> &'static str {
     }
 }
 
+/// Starts capture with the requested method. `auto` tries NvFBC for screens and falls back to
+/// Windows Graphics Capture, saying why.
+fn start_capture(gpu: &Gpu, target: &Target, m: args::CaptureMethod, cursor: bool) -> Result<(Capture, Method), String> {
+    let e = |x: windows::core::Error| x.message().to_string();
+    let method = match m {
+        args::CaptureMethod::Nvfbc => Method::Nvfbc,
+        args::CaptureMethod::Wgc => Method::Wgc,
+        args::CaptureMethod::Dxgi => Method::Dxgi,
+        args::CaptureMethod::Auto => {
+            if matches!(target, Target::Monitor(_)) {
+                match Capture::start(gpu, target, Method::Nvfbc, cursor) {
+                    Ok(c) => return Ok((c, Method::Nvfbc)),
+                    Err(x) => eprintln!("rbuf: NvFBC unavailable ({}), using Windows Graphics Capture", x.message()),
+                }
+            }
+            Method::Wgc
+        }
+    };
+    Ok((Capture::start(gpu, target, method, cursor).map_err(e)?, method))
+}
+
 pub fn run(o: Options) -> Result<(), String> {
     let e = |x: windows::core::Error| x.message().to_string();
     unsafe {
@@ -217,7 +240,7 @@ pub fn run(o: Options) -> Result<(), String> {
     let target = resolve_target(&o.window)?;
     let sources: Vec<Source> = o.audio.iter().map(|a| Source::parse(a)).collect::<Result<_, _>>()?;
     let gpu = Gpu::new(o.adapter).map_err(e)?;
-    let cap = Capture::start(&gpu, &target, if o.dxgi { Method::Dxgi } else { Method::Wgc }, o.cursor).map_err(e)?;
+    let (cap, method) = start_capture(&gpu, &target, o.capture, o.cursor)?;
     // Wait for the first frame (Windows Graphics Capture sends one at once; duplication when the screen changes).
     let t0 = Instant::now();
     while cap.latest.lock().unwrap().seq == 0 && t0.elapsed() < Duration::from_secs(3) {
@@ -323,7 +346,9 @@ pub fn run(o: Options) -> Result<(), String> {
                 }
                 i += 1;
                 let l = latest.lock().unwrap();
-                let Some(tex) = l.texture.clone() else { continue };
+                let Some(tex) = l.texture.clone() else {
+                    continue;
+                };
                 let fresh = l.seq != last_seq;
                 if !cfr && !fresh {
                     continue;
@@ -439,7 +464,12 @@ pub fn run(o: Options) -> Result<(), String> {
         Target::Focused => "the focused window".into(),
     };
     eprintln!(
-        "rbuf: {what} at {w}x{h}, {} fps {}, {} on {enc_name}, {:.1} Mbit/s {}",
+        "rbuf: {what} at {w}x{h} via {}, {} fps {}, {} on {enc_name}, {:.1} Mbit/s {}",
+        match method {
+            Method::Nvfbc => "NvFBC",
+            Method::Wgc => "Windows Graphics Capture",
+            Method::Dxgi => "Desktop Duplication",
+        },
         o.fps,
         if cfr { "constant" } else { "variable" },
         codec_label(codec),
@@ -529,7 +559,9 @@ pub fn run(o: Options) -> Result<(), String> {
                 }
                 match recording.take() {
                     Some(rec) => match rec.finish(video.config(), frame_ticks) {
-                        Ok((p, d, s)) => eprintln!("rbuf: recorded {d:.1} s, {}: {}", size(s), p.display()),
+                        Ok((p, d, s)) => {
+                            eprintln!("rbuf: recorded {d:.1} s, {}: {}", size(s), p.display())
+                        }
                         Err(x) => eprintln!("rbuf: recording failed: {x}"),
                     },
                     None => {
