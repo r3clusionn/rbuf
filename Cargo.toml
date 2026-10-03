@@ -1,0 +1,64 @@
+[package]
+name = "rbuf"
+version = "0.1.0"
+edition = "2021"
+description = "A ShadowPlay-style replay buffer and screen recorder for Windows: Windows Graphics Capture, GPU color conversion, hardware H.264, HEVC and AV1 encoding, per-process audio tracks, own MP4 muxer."
+license = "MIT"
+
+[lib]
+name = "rbuf"
+
+[[bin]]
+name = "rbuf"
+path = "src/main.rs"
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+  "Foundation",
+  "Graphics",
+  "Graphics_Capture",
+  "Graphics_DirectX",
+  "Graphics_DirectX_Direct3D11",
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Direct3D_Fxc",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_Media",
+  "Win32_Media_Audio",
+  "Win32_Media_KernelStreaming",
+  "Win32_Media_MediaFoundation",
+  "Win32_Media_Multimedia",
+  "Win32_Security",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Ole",
+  "Win32_System_Performance",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_System_WinRT",
+  "Win32_System_WinRT_Direct3D11",
+  "Win32_System_WinRT_Graphics_Capture",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3"
