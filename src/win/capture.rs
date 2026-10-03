@@ -136,7 +136,8 @@ pub(super) fn copy_into(gpu: &Gpu, latest: &Mutex<Latest>, src: &ID3D11Texture2D
 }
 
 impl Capture {
-    pub fn start(gpu: &Gpu, target: &Target, method: Method, cursor: bool) -> Result<Capture> {
+    /// `fps` is the output frame rate; NvFBC grabs no more often than that.
+    pub fn start(gpu: &Gpu, target: &Target, method: Method, fps: u32, cursor: bool) -> Result<Capture> {
         let latest = Arc::new(Mutex::new(Latest { texture: None, content: (0, 0), time: 0, seq: 0 }));
         let mons = monitors();
         let monitor = |i: Option<usize>| -> Result<HMONITOR> {
@@ -151,8 +152,9 @@ impl Capture {
             let Target::Monitor(i) = target else {
                 return Err(windows::core::Error::new(windows::core::HRESULT(-1), "NvFBC captures monitors only"));
             };
-            let ordinal = output_ordinal(monitor(*i)?);
-            let n = super::nvfbc::NvfbcCapture::start(gpu, ordinal, cursor, latest.clone())
+            let (ordinal, output) = find_output(monitor(*i)?);
+            let vblank = output.map(super::nvfbc::VBlank);
+            let n = super::nvfbc::NvfbcCapture::start(gpu, ordinal, vblank, fps, cursor, latest.clone())
                 .map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e))?;
             return Ok(Capture { latest, size: n.size, _wgc: None, dxgi: None, _nvfbc: Some(n) });
         }
@@ -265,12 +267,12 @@ impl Capture {
 }
 
 /// The display's position in DXGI's enumeration of outputs over all adapters, which is the
-/// adapter ordinal NvFBC expects (0 is the primary display).
-fn output_ordinal(mon: HMONITOR) -> u32 {
+/// adapter ordinal NvFBC expects (0 is the primary display), and its DXGI output.
+fn find_output(mon: HMONITOR) -> (u32, Option<windows::Win32::Graphics::Dxgi::IDXGIOutput>) {
     let Ok(f) =
         (unsafe { windows::Win32::Graphics::Dxgi::CreateDXGIFactory1::<windows::Win32::Graphics::Dxgi::IDXGIFactory1>() })
     else {
-        return 0;
+        return (0, None);
     };
     let mut n = 0;
     let mut a = 0;
@@ -278,14 +280,14 @@ fn output_ordinal(mon: HMONITOR) -> u32 {
         let mut o = 0;
         while let Ok(out) = unsafe { adapter.EnumOutputs(o) } {
             if unsafe { out.GetDesc() }.map(|d| d.Monitor == mon).unwrap_or(false) {
-                return n;
+                return (n, Some(out));
             }
             n += 1;
             o += 1;
         }
         a += 1;
     }
-    0
+    (0, None)
 }
 
 /// The WinRT Direct3D device wrapper is agile, so the free-threaded frame pool may use it from its

@@ -80,7 +80,7 @@ fn main() {
         );
         let mut origin = windows::Win32::Foundation::POINT::default();
         let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut origin);
-        println!("hwnd 0x{:x} client {} {}", hwnd.0 as usize, origin.x - vis.left, origin.y - vis.top);
+        println!("hwnd 0x{:x} client {} {} screen {} {}", hwnd.0 as usize, origin.x - vis.left, origin.y - vis.top, origin.x, origin.y);
         use std::io::Write;
         let _ = std::io::stdout().flush();
         let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);

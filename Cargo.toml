@@ -1,6 +1,6 @@
 [package]
 name = "rbuf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A ShadowPlay-style replay buffer and screen recorder for Windows: Windows Graphics Capture, GPU color conversion, hardware H.264, HEVC and AV1 encoding, per-process audio tracks, own MP4 muxer."
 license = "MIT"

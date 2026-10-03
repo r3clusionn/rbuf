@@ -9,6 +9,11 @@
 //! by the open source nvidia-patch project. Nothing is patched or injected: rbuf calls the
 //! driver's DLL like any NvFBC application, it just includes the key.
 //!
+//! NvFBC's own "wait for the next frame" grab spins a CPU core inside the driver (75% of one
+//! logical CPU at 60 Hz, measured; switching the CUDA context to blocking sync does not change
+//! it). So rbuf paces the grabs itself: it sleeps in `IDXGIOutput::WaitForVBlank`, a kernel wait,
+//! and then takes the frame the driver already has with a non-blocking grab.
+//!
 //! Both DLLs (`NvFBC64.dll`, `nvcuda.dll`) are loaded at run time, so rbuf still starts on
 //! machines without them and falls back to Windows Graphics Capture.
 
@@ -21,6 +26,7 @@ use windows::core::{s, Interface, PCSTR};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::IDXGIOutput;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 
 use super::capture::Latest;
@@ -41,10 +47,11 @@ const KEY: [u32; 4] = [0xAEF5_7AC5, 0x401D_1A39, 0x1B85_6BBE, 0x9ED0_CEBA];
 const INTERFACE_CUDA: u32 = 0x1007;
 /// `NVFBC_TOCUDA_ARGB`: 8-bit B, G, R, A bytes, the layout of `DXGI_FORMAT_B8G8R8A8_UNORM`.
 const FORMAT_ARGB: u32 = 0;
-/// Setup flag: draw the hardware cursor into the frame.
-const SETUP_WITH_CURSOR: u32 = 1;
-/// Grab flag: wait for a new frame (the default; `NOWAIT` would copy stale frames).
-const GRAB_WAIT: u32 = 0;
+/// Grab flag `NVFBC_TOCUDA_WITH_HWCURSOR`: draw the hardware cursor into the frame. (Setup flag
+/// bit 0 is `bEnableSeparateCursorCapture`, which leaves the cursor out; it stays clear.)
+const GRAB_WITH_CURSOR: u32 = 0x4;
+/// Grab flag `NVFBC_TOCUDA_NOWAIT`: return the newest frame at once (see the module comment).
+const GRAB_NOWAIT: u32 = 0x1;
 
 #[repr(C)]
 struct CreateParams {
@@ -182,7 +189,7 @@ struct Cuda {
     map: unsafe extern "system" fn(u32, *mut *mut c_void, *mut c_void) -> CuResult,
     unmap: unsafe extern "system" fn(u32, *mut *mut c_void, *mut c_void) -> CuResult,
     mapped_array: unsafe extern "system" fn(*mut usize, *mut c_void, u32, u32) -> CuResult,
-    memcpy_2d: unsafe extern "system" fn(*const Memcpy2D) -> CuResult,
+    memcpy_2d_async: unsafe extern "system" fn(*const Memcpy2D, *mut c_void) -> CuResult,
 }
 
 unsafe fn sym<T>(m: HMODULE, name: PCSTR) -> Result<T, String> {
@@ -207,7 +214,7 @@ impl Cuda {
                 map: sym(m, s!("cuGraphicsMapResources"))?,
                 unmap: sym(m, s!("cuGraphicsUnmapResources"))?,
                 mapped_array: sym(m, s!("cuGraphicsSubResourceGetMappedArray"))?,
-                memcpy_2d: sym(m, s!("cuMemcpy2D_v2"))?,
+                memcpy_2d_async: sym(m, s!("cuMemcpy2DAsync_v2"))?,
             })
         }
     }
@@ -277,6 +284,10 @@ pub struct NvfbcCapture {
     thread: Option<JoinHandle<()>>,
 }
 
+/// The display's DXGI output, for vblank waits on the capture thread. DXGI objects are free-threaded.
+pub struct VBlank(pub IDXGIOutput);
+unsafe impl Send for VBlank {}
+
 /// Raw pointers handed to the capture thread.
 struct Session {
     object: *mut c_void,
@@ -298,8 +309,16 @@ struct Target {
 }
 
 impl NvfbcCapture {
-    /// Captures display `adapter` (0 is the primary display). `latest` receives every frame.
-    pub fn start(gpu: &Gpu, adapter: u32, cursor: bool, latest: Arc<Mutex<Latest>>) -> Result<NvfbcCapture, String> {
+    /// Captures display `adapter` (0 is the primary display) at most `fps` times a second, once per
+    /// vertical blank of `vblank` (or on a timer without it). `latest` receives every frame.
+    pub fn start(
+        gpu: &Gpu,
+        adapter: u32,
+        vblank: Option<VBlank>,
+        fps: u32,
+        cursor: bool,
+        latest: Arc<Mutex<Latest>>,
+    ) -> Result<NvfbcCapture, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<Result<(u32, u32), String>>();
         let (g, s2) = (gpu.clone(), stop.clone());
@@ -336,7 +355,6 @@ impl NvfbcCapture {
                     let setup_fn: unsafe extern "system" fn(*mut c_void, *mut CudaSetupParams) -> i32 = session.slot(SLOT_SETUP);
                     let mut sp: CudaSetupParams = std::mem::zeroed();
                     sp.version = struct_version(std::mem::size_of::<CudaSetupParams>(), 1);
-                    sp.flags = if cursor { SETUP_WITH_CURSOR } else { 0 };
                     sp.format = FORMAT_ARGB;
                     let r = setup_fn(session.object, &mut sp);
                     if r != 0 {
@@ -352,7 +370,8 @@ impl NvfbcCapture {
                     return;
                 }
             };
-            run(&g, &cuda, session, &latest, &s2, tx);
+            let pace = Pace { vblank, interval: 10_000_000 / fps.max(1) as i64, cursor };
+            run(&g, &cuda, session, &pace, &latest, &s2, tx);
         });
         match rx.recv() {
             Ok(Ok(size)) => Ok(NvfbcCapture { size, stop, thread: Some(thread) }),
@@ -365,11 +384,45 @@ impl NvfbcCapture {
     }
 }
 
-/// The capture loop: grab (waiting for a new frame), copy into the registered texture, publish.
+/// When and how the capture thread grabs.
+struct Pace {
+    vblank: Option<VBlank>,
+    /// The shortest time between grabs, in 100 ns ticks (one output frame).
+    interval: i64,
+    cursor: bool,
+}
+
+impl Pace {
+    /// Waits for the next vertical blank at least three quarters of a frame after `last` (a
+    /// 144 Hz display recorded at 60 fps is grabbed on every second or third blank), or without a
+    /// usable output, until a whole frame has passed.
+    fn wait(&self, last: i64) {
+        loop {
+            let ok = match &self.vblank {
+                Some(v) => unsafe { v.0.WaitForVBlank() }.is_ok(),
+                None => false,
+            };
+            let now = clock::now();
+            if !ok {
+                let left = last + self.interval - now;
+                if left > 0 {
+                    std::thread::sleep(std::time::Duration::from_nanos(left as u64 * 100));
+                }
+                return;
+            }
+            if now - last >= self.interval * 3 / 4 {
+                return;
+            }
+        }
+    }
+}
+
+/// The capture loop: wait for the next grab time, grab, copy into the registered texture, publish.
 fn run(
     gpu: &Gpu,
     cuda: &Cuda,
     session: Session,
+    pace: &Pace,
     latest: &Mutex<Latest>,
     stop: &AtomicBool,
     ready: mpsc::Sender<Result<(u32, u32), String>>,
@@ -378,16 +431,19 @@ fn run(
     let mut target: Option<Target> = None;
     let mut ready = Some(ready);
     let mut failures = 0;
+    let mut last = i64::MIN / 2;
     while !stop.load(Ordering::Relaxed) {
+        pace.wait(last);
+        last = clock::now();
         // SAFETY: plain integers; all zero is the documented initial state.
         let mut info: GrabInfo = unsafe { std::mem::zeroed() };
         let mut gp: CudaGrabParams = unsafe { std::mem::zeroed() };
         gp.version = struct_version(std::mem::size_of::<CudaGrabParams>(), 1);
-        gp.flags = GRAB_WAIT;
+        gp.flags = GRAB_NOWAIT | if pace.cursor { GRAB_WITH_CURSOR } else { 0 };
         gp.buffer = session.buffer;
         gp.info = &mut info;
         let r = unsafe { grab(session.object, &mut gp) };
-        let time = clock::now();
+        let time = last;
         if r != 0 {
             failures += 1;
             if let Some(tx) = ready.take() {
@@ -434,8 +490,9 @@ fn run(
                     height: h as usize,
                     ..Default::default()
                 };
-                let r2 = if r == 0 { (cuda.memcpy_2d)(&c) } else { r };
-                // Unmapping orders the copy before any Direct3D use of the texture.
+                // Queued on the default stream: no CPU wait. Unmapping orders the copy before any
+                // Direct3D use of the texture.
+                let r2 = if r == 0 { (cuda.memcpy_2d_async)(&c, std::ptr::null_mut()) } else { r };
                 cu((cuda.unmap)(1, &mut t.resource, std::ptr::null_mut()), "unmap")?;
                 cu(r2, "copy")?;
             }
@@ -472,8 +529,8 @@ fn run(
 impl Drop for NvfbcCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // A grab waits for the next frame, which on a still screen may not come: give it a moment,
-        // then let the process exit take the thread.
+        // The thread checks the flag once per grab, so it ends within a frame; the wait below is a
+        // safety margin, not the normal path.
         if let Some(t) = self.thread.take() {
             let end = std::time::Instant::now() + std::time::Duration::from_millis(500);
             while !t.is_finished() && std::time::Instant::now() < end {

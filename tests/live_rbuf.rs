@@ -2,7 +2,7 @@
 //! a hardware encoder and ffmpeg on PATH, and skip themselves (saying so) otherwise.
 //!
 //! * colours: record the `patches` example window with each codec and compare decoded pixels with
-//!   the colours it draws;
+//!   the colours it draws, once captured as a window and once as the screen through NvFBC;
 //! * replay: run a replay buffer, save it with `rbuf save`, stop it with `rbuf stop`, and check
 //!   the clip's length, first frame and decode.
 
@@ -36,23 +36,28 @@ fn rbuf(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_rbuf")).args(args).output().unwrap()
 }
 
-#[test]
-fn colours_survive_capture_conversion_and_every_codec() {
-    if !ready() {
-        return;
-    }
+/// Records the `patches` window (`screen`: the whole primary screen through NvFBC, else the window
+/// itself) with each codec and checks the decoded colours.
+fn check_patches(screen: bool) {
     let dir = tempfile::tempdir().unwrap();
     for codec in ["h264", "hevc", "av1"] {
         let mut win = Command::new(example("patches")).arg("6").stdout(Stdio::piped()).spawn().unwrap();
         let mut line = String::new();
         use std::io::BufRead;
         std::io::BufReader::new(win.stdout.as_mut().unwrap()).read_line(&mut line).unwrap();
-        // "hwnd 0x1234 client 1 31"
+        // "hwnd 0x1234 client 1 31 screen 61 91"
         let f: Vec<&str> = line.split_whitespace().collect();
-        let (hwnd, cx, cy): (&str, usize, usize) = (f[1], f[3].parse().unwrap(), f[4].parse().unwrap());
+        let at = if screen { 6 } else { 3 };
+        let (hwnd, cx, cy): (&str, usize, usize) = (f[1], f[at].parse().unwrap(), f[at + 1].parse().unwrap());
         let out = dir.path().join(format!("{codec}.mp4"));
-        let r =
-            rbuf(&["-w", &format!("hwnd:{hwnd}"), "-k", codec, "-bm", "qp", "-q", "90", "-o", out.to_str().unwrap(), "-t", "2"]);
+        let target = format!("hwnd:{hwnd}");
+        let mut args = vec!["-k", codec, "-bm", "qp", "-q", "90", "-o", out.to_str().unwrap(), "-t", "2", "-cursor", "no"];
+        if screen {
+            args.extend(["-w", "screen", "-capture", "nvfbc"]);
+        } else {
+            args.extend(["-w", target.as_str()]);
+        }
+        let r = rbuf(&args);
         let _ = win.kill();
         let _ = win.wait();
         assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
@@ -82,8 +87,27 @@ fn colours_survive_capture_conversion_and_every_codec() {
             worst = worst.max(err);
             assert!(err <= 4, "{codec} patch {i}: drew {want:?}, decoded {got:?}");
         }
-        eprintln!("{codec}: worst channel error {worst}/255");
+        eprintln!("{} {codec}: worst channel error {worst}/255", if screen { "NvFBC" } else { "window" });
     }
+}
+
+#[test]
+fn colours_survive_capture_conversion_and_every_codec() {
+    if ready() {
+        check_patches(false);
+    }
+}
+
+#[test]
+fn colours_survive_nvfbc_capture() {
+    if !ready() {
+        return;
+    }
+    if !rbuf::win::nvfbc::probe().iter().any(|l| l.contains("to CUDA, display 0, with key: ok")) {
+        eprintln!("SKIPPED: NvFBC is not available");
+        return;
+    }
+    check_patches(true);
 }
 
 #[test]

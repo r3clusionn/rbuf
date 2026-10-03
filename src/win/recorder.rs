@@ -213,7 +213,7 @@ fn codec_label(c: VideoCodec) -> &'static str {
 
 /// Starts capture with the requested method. `auto` tries NvFBC for screens and falls back to
 /// Windows Graphics Capture, saying why.
-fn start_capture(gpu: &Gpu, target: &Target, m: args::CaptureMethod, cursor: bool) -> Result<(Capture, Method), String> {
+fn start_capture(gpu: &Gpu, target: &Target, m: args::CaptureMethod, fps: u32, cursor: bool) -> Result<(Capture, Method), String> {
     let e = |x: windows::core::Error| x.message().to_string();
     let method = match m {
         args::CaptureMethod::Nvfbc => Method::Nvfbc,
@@ -221,7 +221,7 @@ fn start_capture(gpu: &Gpu, target: &Target, m: args::CaptureMethod, cursor: boo
         args::CaptureMethod::Dxgi => Method::Dxgi,
         args::CaptureMethod::Auto => {
             if matches!(target, Target::Monitor(_)) {
-                match Capture::start(gpu, target, Method::Nvfbc, cursor) {
+                match Capture::start(gpu, target, Method::Nvfbc, fps, cursor) {
                     Ok(c) => return Ok((c, Method::Nvfbc)),
                     Err(x) => eprintln!("rbuf: NvFBC unavailable ({}), using Windows Graphics Capture", x.message()),
                 }
@@ -229,7 +229,7 @@ fn start_capture(gpu: &Gpu, target: &Target, m: args::CaptureMethod, cursor: boo
             Method::Wgc
         }
     };
-    Ok((Capture::start(gpu, target, method, cursor).map_err(e)?, method))
+    Ok((Capture::start(gpu, target, method, fps, cursor).map_err(e)?, method))
 }
 
 pub fn run(o: Options) -> Result<(), String> {
@@ -240,7 +240,7 @@ pub fn run(o: Options) -> Result<(), String> {
     let target = resolve_target(&o.window)?;
     let sources: Vec<Source> = o.audio.iter().map(|a| Source::parse(a)).collect::<Result<_, _>>()?;
     let gpu = Gpu::new(o.adapter).map_err(e)?;
-    let (cap, method) = start_capture(&gpu, &target, o.capture, o.cursor)?;
+    let (cap, method) = start_capture(&gpu, &target, o.capture, o.fps, o.cursor)?;
     // Wait for the first frame (Windows Graphics Capture sends one at once; duplication when the screen changes).
     let t0 = Instant::now();
     while cap.latest.lock().unwrap().seq == 0 && t0.elapsed() < Duration::from_secs(3) {
