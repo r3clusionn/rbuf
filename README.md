@@ -2,8 +2,6 @@
 
 A ShadowPlay-style replay buffer and screen recorder for Windows: it keeps the last N seconds of your screen and audio in memory and saves them as an MP4 on a hotkey, or records straight to a file. Frames stay on the GPU from capture to the hardware encoder, every audio source (the whole desktop, the microphone, one game) gets its own track, and the command line follows gpu-screen-recorder's. For anyone who wants instant replay without a vendor's overlay, on any GPU vendor's encoder.
 
-**Status:** v0.4.0, working on Windows 11 with an NVIDIA GPU (the only GPU it has been run on), capturing through NvFBC straight into NVENC by default. Not released as a binary.
-
 ## Compared with ShadowPlay and OBS
 
 | Recording a game that runs at 1,218 fps | **rbuf** | ShadowPlay | OBS Studio (display capture) |
