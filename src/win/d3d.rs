@@ -6,6 +6,7 @@ use windows::Win32::Foundation::{HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D, D3D11_BIND_FLAG,
+    D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT,
 };
@@ -56,7 +57,12 @@ impl Gpu {
                 &a,
                 D3D_DRIVER_TYPE_UNKNOWN,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                // No driver worker thread: rbuf issues a handful of calls per frame, and NVIDIA's
+                // worker spins waiting for them. Measured (xperf): rbuf's CPU time under NvFBC went
+                // from 6 to 8% of one logical CPU to 4 to 5% with this flag.
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT
+                    | D3D11_CREATE_DEVICE_VIDEO_SUPPORT
+                    | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
                 Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
                 D3D11_SDK_VERSION,
                 Some(&mut device),
@@ -99,4 +105,28 @@ pub fn texture_size(t: &ID3D11Texture2D) -> (u32, u32) {
     let mut d = D3D11_TEXTURE2D_DESC::default();
     unsafe { t.GetDesc(&mut d) };
     (d.Width, d.Height)
+}
+
+/// Puts this process in the realtime GPU scheduling class (`D3DKMTSetProcessSchedulingPriorityClass`,
+/// falling back to high), so its capture and encoding work is not queued behind a GPU-bound game.
+/// Windows grants it to normal, non-elevated processes on the test machine.
+pub fn raise_gpu_priority() -> std::result::Result<(), u32> {
+    use windows::core::s;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    const HIGH: i32 = 4;
+    const REALTIME: i32 = 5;
+    unsafe {
+        let m = LoadLibraryA(s!("gdi32.dll")).map_err(|e| e.code().0 as u32)?;
+        let f = GetProcAddress(m, s!("D3DKMTSetProcessSchedulingPriorityClass")).ok_or(0xC000_0139u32)?;
+        let set: unsafe extern "system" fn(HANDLE, i32) -> i32 = std::mem::transmute(f);
+        match set(GetCurrentProcess(), REALTIME) {
+            0 => Ok(()),
+            _ => match set(GetCurrentProcess(), HIGH) {
+                0 => Ok(()),
+                status => Err(status as u32),
+            },
+        }
+    }
 }

@@ -13,7 +13,9 @@ usage:
   rbuf --nvfbc-status | --nvfbc-enable | --nvfbc-disable           NvFBC state (enable/disable need administrator)
 
 options (as in gpu-screen-recorder):
-  -w screen|screen:N|focused|window:TITLE|hwnd:0xHANDLE   what to capture (default screen: the primary monitor)
+  -w screen|screen:N|focused|window:TITLE|hwnd:0xHANDLE|process:NAME|PID
+                     what to capture (default screen: the primary monitor); with NvFBC a window or a process
+                     is captured as its process presents: the game alone, focused or not
   -f FPS             frame rate (default 60)
   -k h264|hevc|av1   codec (default h264)
   -bm cbr|vbr|qp     bitrate mode (default vbr)
@@ -26,7 +28,7 @@ options (as in gpu-screen-recorder):
   -cursor yes|no     capture the mouse cursor (default yes)
   -fm cfr|vfr        constant or variable frame rate (default cfr)
   -gop SECONDS       keyframe interval, the precision of a saved clip's start (default 1)
-  -capture auto|nvfbc|wgc|dxgi  auto (default): NvFBC for screens on NVIDIA GPUs, else Windows Graphics Capture;
+  -capture auto|nvfbc|wgc|dxgi  auto (default): NvFBC on NVIDIA GPUs, else Windows Graphics Capture;
                      dxgi is DXGI Desktop Duplication (screens only)
   -ram-limit MB      cap the replay buffer's memory
   -hotkey-save KEYS  default ctrl+alt+f10 (ShadowPlay uses alt+f10)

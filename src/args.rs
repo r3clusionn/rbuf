@@ -31,6 +31,8 @@ pub enum Window {
     /// Part of a window title, matched without case.
     Title(String),
     Handle(isize),
+    /// A process by executable name or pid: its frames, taken by NvFBC as it presents them.
+    Process(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,6 +97,8 @@ impl Default for Options {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+// Parsed once per run, so the size of `Run` does not matter.
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     Run(Options),
     /// Tell a running instance to save, start/stop recording, or quit.
@@ -197,11 +201,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                     "focused" => Window::Focused,
                     _ if v.starts_with("screen:") => Window::Screen(Some(num(&v[7..], "-w screen:N")? as usize)),
                     _ if v.starts_with("window:") => Window::Title(v[7..].to_string()),
+                    _ if v.starts_with("process:") && v.len() > 8 => Window::Process(v[8..].to_string()),
                     _ if v.starts_with("hwnd:") => {
                         let h = v[5..].trim_start_matches("0x");
                         Window::Handle(isize::from_str_radix(h, 16).map_err(|_| format!("-w hwnd: `{v}` is not a hex handle"))?)
                     }
-                    _ => return Err(format!("-w: `{v}` (screen, screen:N, focused, window:TITLE or hwnd:0xHANDLE)")),
+                    _ => return Err(format!("-w: `{v}` (screen, screen:N, focused, window:TITLE, hwnd:0xHANDLE or process:NAME|PID)")),
                 };
             }
             "-c" => {
@@ -359,6 +364,9 @@ mod tests {
         assert_eq!(o.window, Window::Handle(0x1a2b));
         let Command::Run(o) = p("-w screen:1 -o x.mp4").unwrap() else { panic!() };
         assert_eq!(o.window, Window::Screen(Some(1)));
+        let Command::Run(o) = p("-w process:game.exe -o x.mp4").unwrap() else { panic!() };
+        assert_eq!(o.window, Window::Process("game.exe".into()));
+        assert!(p("-w process: -o x.mp4").is_err());
     }
 
     #[test]

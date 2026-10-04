@@ -185,6 +185,10 @@ fn resolve_target(w: &Window) -> Result<Target, String> {
         }
         Window::Focused => Target::Focused,
         Window::Handle(h) => Target::Window(*h),
+        Window::Process(p) => Target::Process(match p.parse::<u32>() {
+            Ok(pid) => pid,
+            Err(_) => audio::find_process(p).ok_or_else(|| format!("no running process is called `{p}`"))?,
+        }),
         Window::Title(t) => {
             let want = t.to_ascii_lowercase();
             let found = capture::windows().into_iter().find(|(_, title)| title.to_ascii_lowercase().contains(&want));
@@ -213,16 +217,26 @@ fn codec_label(c: VideoCodec) -> &'static str {
 
 /// Starts capture with the requested method. `auto` tries NvFBC for screens and falls back to
 /// Windows Graphics Capture, saying why.
-fn start_capture(gpu: &Gpu, target: &Target, m: args::CaptureMethod, fps: u32, cursor: bool) -> Result<(Capture, Method), String> {
+fn start_capture(
+    gpu: &Gpu,
+    target: &Target,
+    m: args::CaptureMethod,
+    fps: u32,
+    cursor: bool,
+) -> Result<(Capture, Method), String> {
     let e = |x: windows::core::Error| x.message().to_string();
     let method = match m {
         args::CaptureMethod::Nvfbc => Method::Nvfbc,
         args::CaptureMethod::Wgc => Method::Wgc,
         args::CaptureMethod::Dxgi => Method::Dxgi,
         args::CaptureMethod::Auto => {
-            if matches!(target, Target::Monitor(_)) {
+            // Screens and processes. A window goes to Windows Graphics Capture unless NvFBC is asked
+            // for: NvFBC takes a process's Direct3D presents, and a window drawn another way (GDI)
+            // would come out black.
+            if matches!(target, Target::Monitor(_) | Target::Process(_)) {
                 match Capture::start(gpu, target, Method::Nvfbc, fps, cursor) {
                     Ok(c) => return Ok((c, Method::Nvfbc)),
+                    Err(x) if matches!(target, Target::Process(_)) => return Err(e(x)),
                     Err(x) => eprintln!("rbuf: NvFBC unavailable ({}), using Windows Graphics Capture", x.message()),
                 }
             }
@@ -241,6 +255,17 @@ pub fn run(o: Options) -> Result<(), String> {
     let sources: Vec<Source> = o.audio.iter().map(|a| Source::parse(a)).collect::<Result<_, _>>()?;
     let gpu = Gpu::new(o.adapter).map_err(e)?;
     let (cap, method) = start_capture(&gpu, &target, o.capture, o.fps, o.cursor)?;
+    // NvFBC's grabs and rbuf's conversion and encoding are a few small GPU jobs per frame. Under a
+    // game that keeps the GPU busy with long frames they wait behind it at normal priority:
+    // measured with a 245 fps full-screen game, the encoder then got 1 to 6 frames a second. At
+    // the realtime scheduling class all 60 arrive and the game's rate does not change. Windows
+    // Graphics Capture does not need it (the compositor captures) and loses game frames with it,
+    // so only NvFBC gets it (README).
+    if method == Method::Nvfbc {
+        if let Err(status) = super::d3d::raise_gpu_priority() {
+            eprintln!("rbuf: could not raise the GPU scheduling priority (0x{status:08x}); a GPU-bound game may starve the recording");
+        }
+    }
     // Wait for the first frame (Windows Graphics Capture sends one at once; duplication when the screen changes).
     let t0 = Instant::now();
     while cap.latest.lock().unwrap().seq == 0 && t0.elapsed() < Duration::from_secs(3) {
@@ -327,6 +352,7 @@ pub fn run(o: Options) -> Result<(), String> {
     let stats = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]); // encoded, repeated, dropped
     let fps = o.fps as i64;
     let cfr = o.cfr;
+    let wait_fresh = method == Method::Nvfbc;
     let pacer = {
         let (stop, force_key, stats, latest) = (stop.clone(), force_key.clone(), stats.clone(), cap.latest.clone());
         std::thread::spawn(move || {
@@ -345,6 +371,21 @@ pub fn run(o: Options) -> Result<(), String> {
                     std::thread::sleep(left.saturating_sub(Duration::from_micros(800)).max(Duration::from_micros(200)));
                 }
                 i += 1;
+                if wait_fresh {
+                    // NvFBC grabs once per output frame on vertical blanks, on a clock of its own, so
+                    // the newest grab can be up to a frame older than this tick. Take the grab nearest
+                    // to the tick: when the newest is more than half a frame old, the next one, due
+                    // within half a frame, is nearer. Without this a whole run could be a frame late
+                    // against the audio (52 ms instead of 35, measured), or repeat and skip frames.
+                    let half = (next - pts) / 2;
+                    loop {
+                        let t = latest.lock().unwrap().time;
+                        if t >= pts - half || clock::now() >= pts + half {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_micros(500));
+                    }
+                }
                 let l = latest.lock().unwrap();
                 let Some(tex) = l.texture.clone() else {
                     continue;
@@ -462,6 +503,7 @@ pub fn run(o: Options) -> Result<(), String> {
         Target::Monitor(None) => "the primary screen".into(),
         Target::Window(_) => "a window".into(),
         Target::Focused => "the focused window".into(),
+        Target::Process(pid) => format!("process {pid}"),
     };
     eprintln!(
         "rbuf: {what} at {w}x{h} via {}, {} fps {}, {} on {enc_name}, {:.1} Mbit/s {}",

@@ -1,7 +1,8 @@
-//! NVIDIA Frame Buffer Capture (NvFBC), the capture path ShadowPlay was built on: the driver
-//! copies the display's frame buffer into CUDA memory with no Desktop Window Manager or DXGI
-//! involvement. From there CUDA copies it into a Direct3D 11 texture that the rest of rbuf uses
-//! like any other captured frame, so the picture never leaves GPU memory.
+//! NVIDIA Frame Buffer Capture (NvFBC), the capture path ShadowPlay is built on: the driver copies
+//! the display's frame buffer, or the frames one process presents, into surfaces of the caller's
+//! Direct3D 9 device, with no Desktop Window Manager or DXGI involvement. rbuf's surfaces are
+//! Direct3D 11 textures shared with that device, so a grabbed frame is already where the rest of
+//! rbuf (the NV12 conversion and the encoder) reads it. The picture never leaves GPU memory.
 //!
 //! The driver ships NvFBC as `NvFBC64.dll` (the Windows API of NVIDIA Capture SDK 7, structure
 //! version 0x70). On GeForce cards `NvFBC_CreateEx` refuses unless the caller passes a
@@ -9,13 +10,18 @@
 //! by the open source nvidia-patch project. Nothing is patched or injected: rbuf calls the
 //! driver's DLL like any NvFBC application, it just includes the key.
 //!
-//! NvFBC's own "wait for the next frame" grab spins a CPU core inside the driver (75% of one
-//! logical CPU at 60 Hz, measured; switching the CUDA context to blocking sync does not change
-//! it). So rbuf paces the grabs itself: it sleeps in `IDXGIOutput::WaitForVBlank`, a kernel wait,
-//! and then takes the frame the driver already has with a non-blocking grab.
+//! Two things here are not in the public SDK and were read out of NvFBC64.dll (its log strings
+//! name the fields; the checks in its code give the offsets): the per-process ("PID") capture
+//! mode, and the v3 layout of the Direct3D 9 interface's setup parameters, the interface
+//! ShadowPlay uses. The CUDA interface rbuf used before took twice the CPU time (6 to 7.5% of
+//! one logical CPU against 2 to 3.5% for this one, measured with the same 60 Hz grab loop).
 //!
-//! Both DLLs (`NvFBC64.dll`, `nvcuda.dll`) are loaded at run time, so rbuf still starts on
-//! machines without them and falls back to Windows Graphics Capture.
+//! NvFBC's own "wait for the next frame" grab spins a CPU core inside the driver. So rbuf paces
+//! the grabs itself: it sleeps in `IDXGIOutput::WaitForVBlank`, a kernel wait, and then takes the
+//! frame the driver already has with a non-blocking grab, exactly once per output frame.
+//!
+//! `NvFBC64.dll` is loaded at run time, so rbuf still starts on machines without it and falls
+//! back to Windows Graphics Capture.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,11 +29,21 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
 use windows::core::{s, Interface, PCSTR};
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE};
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Dxgi::IDXGIOutput;
+use windows::Win32::Foundation::{HANDLE, HMODULE, LUID};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_SHARED, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT,
+};
+use windows::Win32::Graphics::Direct3D9::{
+    Direct3DCreate9Ex, IDirect3DDevice9Ex, IDirect3DQuery9, IDirect3DSurface9, IDirect3DTexture9, D3DCREATE_FPU_PRESERVE,
+    D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DCREATE_NOWINDOWCHANGES, D3DDEVTYPE_HAL, D3DFMT_A8R8G8B8,
+    D3DFMT_UNKNOWN, D3DGETDATA_FLUSH, D3DISSUE_END, D3DPOOL_DEFAULT, D3DPRESENT_PARAMETERS, D3DQUERYTYPE_EVENT, D3DSWAPEFFECT_DISCARD,
+    D3DUSAGE_RENDERTARGET, D3D_SDK_VERSION,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{IDXGIOutput, IDXGIResource};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
 
 use super::capture::Latest;
 use super::clock;
@@ -43,15 +59,18 @@ const fn struct_version(size: usize, ver: u32) -> u32 {
 /// The GeForce private-data key (see the module comment).
 const KEY: [u32; 4] = [0xAEF5_7AC5, 0x401D_1A39, 0x1B85_6BBE, 0x9ED0_CEBA];
 
-/// `NVFBC_SHARED_CUDA`: capture into CUDA device memory.
-const INTERFACE_CUDA: u32 = 0x1007;
-/// `NVFBC_TOCUDA_ARGB`: 8-bit B, G, R, A bytes, the layout of `DXGI_FORMAT_B8G8R8A8_UNORM`.
-const FORMAT_ARGB: u32 = 0;
-/// Grab flag `NVFBC_TOCUDA_WITH_HWCURSOR`: draw the hardware cursor into the frame. (Setup flag
-/// bit 0 is `bEnableSeparateCursorCapture`, which leaves the cursor out; it stays clear.)
-const GRAB_WITH_CURSOR: u32 = 0x4;
-/// Grab flag `NVFBC_TOCUDA_NOWAIT`: return the newest frame at once (see the module comment).
+/// `NVFBC_TO_DX9_VID`: capture into the caller's Direct3D 9 surfaces.
+const INTERFACE_DX9: u32 = 0x2003;
+/// `NVFBC_TO_SYS`, only for `rbuf --nvfbc-status`.
+const INTERFACE_SYS: u32 = 0x1204;
+/// `NVFBC_TODX9VID_ARGB`: 8-bit B, G, R, A, the layout of `DXGI_FORMAT_B8G8R8A8_UNORM`.
+const MODE_ARGB: u32 = 0;
+/// Setup flag bit 0: draw the hardware cursor into the frame.
+const SETUP_WITH_CURSOR: u32 = 0x1;
+/// Grab flag `NVFBC_TODX9VID_NOWAIT`: return the newest frame at once (see the module comment).
 const GRAB_NOWAIT: u32 = 0x1;
+/// NvFBC registers at most three output surfaces.
+const BUFFERS: usize = 3;
 
 #[repr(C)]
 struct CreateParams {
@@ -67,38 +86,65 @@ struct CreateParams {
     adapter_idx: u32,
     nvfbc_version: u32,
     cuda_ctx: *mut c_void,
-    private_data2: *const c_void,
-    private_data2_size: u32,
+    /// `NvFBCCreateParamsPrivateData` (see `PidParams`).
+    pid_data: *const c_void,
+    pid_data_size: u32,
     reserved: [u32; 55],
     reserved_ptrs: [*mut c_void; 27],
 }
 const _: () = assert!(std::mem::size_of::<CreateParams>() == 512);
-const _: () = assert!(std::mem::offset_of!(CreateParams, object) == 40);
+const _: () = assert!(std::mem::offset_of!(CreateParams, device) == 0x10 && std::mem::offset_of!(CreateParams, object) == 0x28);
+const _: () = assert!(std::mem::offset_of!(CreateParams, pid_data) == 0x40 && std::mem::offset_of!(CreateParams, pid_data_size) == 0x48);
 
+/// `NVFBC_TODX9VID_SETUP_PARAMS_V3`. Offsets from the checks in `NvFBCToDx9Vid_v3::NvFBCToDx9VidSetUp`.
 #[repr(C)]
-struct CudaSetupParams {
+struct Dx9SetupParams {
     version: u32,
+    /// Bit 0 hardware cursor, 1 stereo, 2 difference map, 3 separate cursor, 5 classification map.
     flags: u32,
+    mode: u32,
+    buffer_count: u32,
+    diff_map_block_size: u32,
+    stereo_format: u32,
+    diff_map_size: u32,
+    classification_map_size: u32,
+    classification_stamp_width: u32,
+    classification_stamp_height: u32,
+    diff_maps: *mut c_void,
+    classification_maps: *mut c_void,
+    buffers: *const OutBuffer,
     cursor_event: *mut c_void,
-    format: u32,
-    reserved: [u32; 61],
-    reserved_ptrs: [*mut c_void; 31],
+    reserved: [u32; 46],
+    reserved_ptrs: [*mut c_void; 32],
 }
-const _: () = assert!(std::mem::size_of::<CudaSetupParams>() == 512);
-const _: () = assert!(std::mem::offset_of!(CudaSetupParams, format) == 16);
+const _: () = assert!(std::mem::size_of::<Dx9SetupParams>() == 512);
+const _: () = assert!(std::mem::offset_of!(Dx9SetupParams, buffer_count) == 0xc && std::mem::offset_of!(Dx9SetupParams, buffers) == 0x38);
 
+/// `NVFBC_TODX9VID_OUT_BUF`: a surface per eye; only the first is used.
 #[repr(C)]
-struct CudaGrabParams {
+struct OutBuffer {
+    primary: *mut c_void,
+    secondary: *mut c_void,
+}
+
+/// `NVFBC_TODX9VID_GRAB_FRAME_PARAMS`.
+#[repr(C)]
+struct Dx9GrabParams {
     version: u32,
     flags: u32,
-    buffer: u64,
+    target_width: u32,
+    target_height: u32,
+    start_x: u32,
+    start_y: u32,
+    grab_mode: u32,
+    buffer_index: u32,
     info: *mut GrabInfo,
     wait_ms: u32,
-    reserved: [u32; 61],
+    reserved: [u32; 57],
     reserved_ptrs: [*mut c_void; 30],
 }
-const _: () = assert!(std::mem::size_of::<CudaGrabParams>() == 512);
-const _: () = assert!(std::mem::offset_of!(CudaGrabParams, wait_ms) == 24);
+const _: () = assert!(std::mem::size_of::<Dx9GrabParams>() == 512);
+const _: () = assert!(std::mem::offset_of!(Dx9GrabParams, info) == 0x20);
 
 /// `NvFBCFrameGrabInfo`. The driver writes it; it is padded here so a newer, larger layout still
 /// lands inside it.
@@ -124,11 +170,13 @@ struct GrabInfo {
     padding: [u32; 48],
 }
 
-// Vtable slots of the CUDA capture object (`INvFBCCuda`), in declaration order.
-const SLOT_MAX_BUFFER_SIZE: usize = 0;
-const SLOT_SETUP: usize = 1;
-const SLOT_GRAB: usize = 2;
-const SLOT_RELEASE: usize = 5;
+// Vtable slots of the Direct3D 9 capture object (`INvFBCToDx9Vid`), found by following the
+// object's vtable to the functions named in NvFBC64.dll's log strings.
+const SLOT_SETUP: usize = 0;
+const SLOT_GRAB: usize = 1;
+const SLOT_RELEASE: usize = 3;
+/// `INvFBCToSys`'s release, for `--nvfbc-status`.
+const SLOT_SYS_RELEASE: usize = 4;
 
 /// A readable NvFBC error.
 fn nvfbc_error(code: i32) -> String {
@@ -138,58 +186,18 @@ fn nvfbc_error(code: i32) -> String {
         -3 => "session invalidated (display mode change)",
         -4 => "protected content on screen",
         -5 => "driver failure",
-        -6 => "CUDA failure",
         -7 => "unsupported",
         -9 => "incompatible driver",
         -10 => "unsupported platform",
+        -12 => "invalid pointer",
         -13 => "incompatible struct version",
         -15 => "insufficient privileges",
         -18 => "invalid target (not an NVIDIA display)",
+        -19 => "not set up",
         -20 => "dynamically disabled by the driver",
         _ => "error",
     };
     format!("NvFBC {name} ({code})")
-}
-
-// ---- CUDA driver API, the few calls needed ---------------------------------------------------
-
-type CuResult = i32;
-
-#[repr(C)]
-#[derive(Default)]
-struct Memcpy2D {
-    src_x_bytes: usize,
-    src_y: usize,
-    src_memory_type: u32,
-    src_host: usize,
-    src_device: u64,
-    src_array: usize,
-    src_pitch: usize,
-    dst_x_bytes: usize,
-    dst_y: usize,
-    dst_memory_type: u32,
-    dst_host: usize,
-    dst_device: u64,
-    dst_array: usize,
-    dst_pitch: usize,
-    width_bytes: usize,
-    height: usize,
-}
-const _: () = assert!(std::mem::size_of::<Memcpy2D>() == 128);
-const CU_MEMORYTYPE_DEVICE: u32 = 2;
-const CU_MEMORYTYPE_ARRAY: u32 = 3;
-
-struct Cuda {
-    ctx_pop: unsafe extern "system" fn(*mut *mut c_void) -> CuResult,
-    ctx_push: unsafe extern "system" fn(*mut c_void) -> CuResult,
-    mem_alloc: unsafe extern "system" fn(*mut u64, usize) -> CuResult,
-    mem_free: unsafe extern "system" fn(u64) -> CuResult,
-    register: unsafe extern "system" fn(*mut *mut c_void, *mut c_void, u32) -> CuResult,
-    unregister: unsafe extern "system" fn(*mut c_void) -> CuResult,
-    map: unsafe extern "system" fn(u32, *mut *mut c_void, *mut c_void) -> CuResult,
-    unmap: unsafe extern "system" fn(u32, *mut *mut c_void, *mut c_void) -> CuResult,
-    mapped_array: unsafe extern "system" fn(*mut usize, *mut c_void, u32, u32) -> CuResult,
-    memcpy_2d_async: unsafe extern "system" fn(*const Memcpy2D, *mut c_void) -> CuResult,
 }
 
 unsafe fn sym<T>(m: HMODULE, name: PCSTR) -> Result<T, String> {
@@ -199,36 +207,9 @@ unsafe fn sym<T>(m: HMODULE, name: PCSTR) -> Result<T, String> {
     }
 }
 
-impl Cuda {
-    fn load() -> Result<Cuda, String> {
-        unsafe {
-            let m = LoadLibraryA(s!("nvcuda.dll")).map_err(|_| "nvcuda.dll not found (no NVIDIA driver)".to_string())?;
-            // The `_v2` names are what cuda.h maps these calls to on 64-bit.
-            Ok(Cuda {
-                ctx_pop: sym(m, s!("cuCtxPopCurrent_v2"))?,
-                ctx_push: sym(m, s!("cuCtxPushCurrent_v2"))?,
-                mem_alloc: sym(m, s!("cuMemAlloc_v2"))?,
-                mem_free: sym(m, s!("cuMemFree_v2"))?,
-                register: sym(m, s!("cuGraphicsD3D11RegisterResource"))?,
-                unregister: sym(m, s!("cuGraphicsUnregisterResource"))?,
-                map: sym(m, s!("cuGraphicsMapResources"))?,
-                unmap: sym(m, s!("cuGraphicsUnmapResources"))?,
-                mapped_array: sym(m, s!("cuGraphicsSubResourceGetMappedArray"))?,
-                memcpy_2d_async: sym(m, s!("cuMemcpy2DAsync_v2"))?,
-            })
-        }
-    }
+fn hr(e: windows::core::Error, what: &str) -> String {
+    format!("{what}: {}", e.message())
 }
-
-fn cu(r: CuResult, what: &str) -> Result<(), String> {
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(format!("CUDA {what} failed ({r})"))
-    }
-}
-
-// ---- the session ------------------------------------------------------------------------------
 
 /// What the driver reports before capture starts.
 #[derive(Debug, Clone)]
@@ -270,12 +251,32 @@ pub fn status() -> Result<Status, String> {
         if r != 0 {
             return Err(nvfbc_error(r));
         }
-        if std::env::var_os("RBUF_NVFBC_DEBUG").is_some() {
-            eprintln!("status flags 0x{:x}, version 0x{:x}, adapter {}", st.flags, st.nvfbc_version, st.adapter_idx);
-        }
         Ok(Status { sdk_version: sdk, possible_without_key: st.flags & 1 != 0 })
     }
 }
+
+/// What one NvFBC session captures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// A whole display, by NvFBC adapter ordinal.
+    Display(u32),
+    /// What one process presents, taken as it presents ("PID capture mode"): the game alone,
+    /// without other windows, notifications or overlays, whether or not it has the focus.
+    Process(u32),
+}
+
+/// `NvFBCCreateParamsPrivateData`, passed through `CreateParams::pid_data`. Not in the public
+/// SDK: the field names come from NvFBC64.dll's log strings, the 200-byte size and the offsets
+/// from the checks in its `NvFBCCore::InitCore`.
+#[repr(C)]
+struct PidParams {
+    version: u32,
+    capture_mode: u32,
+    target_pid: u32,
+    reserved: [u32; 47],
+}
+const _: () = assert!(std::mem::size_of::<PidParams>() == 200);
+const CAPTURE_MODE_PID: u32 = 1;
 
 /// A running capture. Frames go into `latest` as they arrive.
 pub struct NvfbcCapture {
@@ -288,10 +289,109 @@ pub struct NvfbcCapture {
 pub struct VBlank(pub IDXGIOutput);
 unsafe impl Send for VBlank {}
 
-/// Raw pointers handed to the capture thread.
+/// rbuf's Direct3D 9 device on the same GPU as its Direct3D 11 device, and the query that tells
+/// when a grab has finished on the GPU.
+struct Dx9 {
+    device: IDirect3DDevice9Ex,
+    done: IDirect3DQuery9,
+}
+
+impl Dx9 {
+    fn new(luid: LUID) -> Result<Dx9, String> {
+        unsafe {
+            let d3d = Direct3DCreate9Ex(D3D_SDK_VERSION).map_err(|e| hr(e, "Direct3D 9"))?;
+            let adapter = (0..d3d.GetAdapterCount())
+                .find(|&i| {
+                    let mut l = LUID::default();
+                    d3d.GetAdapterLUID(i, &mut l).is_ok() && l.LowPart == luid.LowPart && l.HighPart == luid.HighPart
+                })
+                .unwrap_or(0);
+            let mut pp = D3DPRESENT_PARAMETERS {
+                BackBufferWidth: 1,
+                BackBufferHeight: 1,
+                BackBufferFormat: D3DFMT_UNKNOWN,
+                BackBufferCount: 1,
+                SwapEffect: D3DSWAPEFFECT_DISCARD,
+                hDeviceWindow: GetDesktopWindow(),
+                Windowed: true.into(),
+                ..Default::default()
+            };
+            let mut device = None;
+            d3d.CreateDeviceEx(
+                adapter,
+                D3DDEVTYPE_HAL,
+                GetDesktopWindow(),
+                (D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE | D3DCREATE_MULTITHREADED | D3DCREATE_NOWINDOWCHANGES)
+                    as u32,
+                &mut pp,
+                std::ptr::null_mut(),
+                &mut device,
+            )
+            .map_err(|e| hr(e, "Direct3D 9 device"))?;
+            let device = device.ok_or("Direct3D 9 device: none returned")?;
+            let done = device.CreateQuery(D3DQUERYTYPE_EVENT).map_err(|e| hr(e, "Direct3D 9 query"))?;
+            Ok(Dx9 { device, done })
+        }
+    }
+
+    /// Waits until the device's work so far (the grab) has finished on the GPU.
+    fn finish(&self) {
+        unsafe {
+            if self.done.Issue(D3DISSUE_END).is_err() {
+                return;
+            }
+            let get = Interface::vtable(&self.done).GetData;
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            // S_FALSE (1) until the GPU is past the query. Grabs are short, but behind a game
+            // that fills the GPU they can wait some milliseconds: sleep rather than spin.
+            while get(self.done.as_raw(), std::ptr::null_mut(), 0, D3DGETDATA_FLUSH).0 == 1 && std::time::Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_micros(250));
+            }
+        }
+    }
+}
+
+/// A Direct3D 11 texture NvFBC writes into through Direct3D 9.
+struct Buffer {
+    texture: ID3D11Texture2D,
+    /// Kept alive while NvFBC holds the surface.
+    _dx9_texture: IDirect3DTexture9,
+    surface: IDirect3DSurface9,
+}
+
+fn make_buffers(gpu: &Gpu, dx9: &Dx9, (w, h): (u32, u32)) -> Result<Vec<Buffer>, String> {
+    (0..BUFFERS)
+        .map(|_| unsafe {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+            };
+            let mut texture = None;
+            gpu.device.CreateTexture2D(&desc, None, Some(&mut texture)).map_err(|e| hr(e, "shared texture"))?;
+            let texture = texture.ok_or("shared texture: none returned")?;
+            let mut handle: HANDLE = texture.cast::<IDXGIResource>().and_then(|r| r.GetSharedHandle()).map_err(|e| hr(e, "shared handle"))?;
+            let mut t9 = None;
+            dx9.device
+                .CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET as u32, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &mut t9, &mut handle)
+                .map_err(|e| hr(e, "opening the shared texture in Direct3D 9"))?;
+            let t9 = t9.ok_or("Direct3D 9 texture: none returned")?;
+            let surface = t9.GetSurfaceLevel(0).map_err(|e| hr(e, "Direct3D 9 surface"))?;
+            Ok(Buffer { texture, _dx9_texture: t9, surface })
+        })
+        .collect()
+}
+
+/// One NvFBC session.
 struct Session {
     object: *mut c_void,
-    buffer: u64,
 }
 unsafe impl Send for Session {}
 
@@ -300,20 +400,103 @@ impl Session {
         let vtable = *(self.object as *const *const *const c_void);
         std::mem::transmute_copy(&*vtable.add(i))
     }
+
+    fn open(create: CreateEx, dx9: &Dx9, source: Source) -> Result<Session, String> {
+        let mut p: CreateParams = unsafe { std::mem::zeroed() };
+        p.version = struct_version(std::mem::size_of::<CreateParams>(), 2);
+        p.interface_type = INTERFACE_DX9;
+        p.device = dx9.device.as_raw();
+        p.private_data = KEY.as_ptr().cast();
+        p.private_data_size = std::mem::size_of_val(&KEY) as u32;
+        let mut pid: PidParams = unsafe { std::mem::zeroed() };
+        match source {
+            Source::Display(adapter) => p.adapter_idx = adapter,
+            Source::Process(target) => {
+                pid.version = struct_version(std::mem::size_of::<PidParams>(), 1);
+                pid.capture_mode = CAPTURE_MODE_PID;
+                pid.target_pid = target;
+                p.pid_data = (&pid as *const PidParams).cast();
+                p.pid_data_size = std::mem::size_of::<PidParams>() as u32;
+            }
+        }
+        let r = unsafe { create(&mut p) };
+        if r != 0 || p.object.is_null() {
+            return Err(format!("creating the session: {}", nvfbc_error(r)));
+        }
+        Ok(Session { object: p.object })
+    }
+
+    /// Registers `buffers` as the grab targets (again after they are replaced).
+    fn setup(&self, buffers: &[Buffer], cursor: bool) -> Result<(), String> {
+        let out: Vec<OutBuffer> =
+            buffers.iter().map(|b| OutBuffer { primary: b.surface.as_raw(), secondary: std::ptr::null_mut() }).collect();
+        let mut sp: Dx9SetupParams = unsafe { std::mem::zeroed() };
+        sp.version = struct_version(std::mem::size_of::<Dx9SetupParams>(), 3);
+        sp.flags = if cursor { SETUP_WITH_CURSOR } else { 0 };
+        sp.mode = MODE_ARGB;
+        sp.buffer_count = out.len() as u32;
+        sp.buffers = out.as_ptr();
+        let setup: unsafe extern "system" fn(*mut c_void, *mut Dx9SetupParams) -> i32 = unsafe { self.slot(SLOT_SETUP) };
+        match unsafe { setup(self.object, &mut sp) } {
+            0 => Ok(()),
+            r => Err(format!("setup: {}", nvfbc_error(r))),
+        }
+    }
+
+    fn grab(&self, index: usize, info: &mut GrabInfo) -> i32 {
+        let mut gp: Dx9GrabParams = unsafe { std::mem::zeroed() };
+        gp.version = struct_version(std::mem::size_of::<Dx9GrabParams>(), 1);
+        gp.flags = GRAB_NOWAIT;
+        gp.buffer_index = index as u32;
+        gp.info = info;
+        let grab: unsafe extern "system" fn(*mut c_void, *mut Dx9GrabParams) -> i32 = unsafe { self.slot(SLOT_GRAB) };
+        unsafe { grab(self.object, &mut gp) }
+    }
+
+    fn close(self) {
+        unsafe {
+            let release: unsafe extern "system" fn(*mut c_void) -> i32 = self.slot(SLOT_RELEASE);
+            release(self.object);
+        }
+    }
 }
 
-/// The texture CUDA writes into, registered once and reused.
-struct Target {
-    texture: ID3D11Texture2D,
-    resource: *mut c_void,
+/// The executable name of a process, for messages.
+fn process_name(pid: u32) -> String {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return format!("pid {pid}") };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut ok = Process32FirstW(snap, &mut e).is_ok();
+        let mut name = format!("pid {pid}");
+        while ok {
+            if e.th32ProcessID == pid {
+                let n = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
+                name = format!("{} (pid {pid})", String::from_utf16_lossy(&e.szExeFile[..n]));
+                break;
+            }
+            ok = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snap);
+        name
+    }
+}
+
+fn describe(source: Source) -> String {
+    match source {
+        Source::Display(_) => "the display".into(),
+        Source::Process(pid) => format!("{} as it presents", process_name(pid)),
+    }
 }
 
 impl NvfbcCapture {
-    /// Captures display `adapter` (0 is the primary display) at most `fps` times a second, once per
-    /// vertical blank of `vblank` (or on a timer without it). `latest` receives every frame.
+    /// Captures `source` at most `fps` times a second, once per vertical blank of `vblank` (or on
+    /// a timer without it). `latest` receives every frame.
     pub fn start(
         gpu: &Gpu,
-        adapter: u32,
+        source: Source,
         vblank: Option<VBlank>,
         fps: u32,
         cursor: bool,
@@ -322,56 +505,30 @@ impl NvfbcCapture {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<Result<(u32, u32), String>>();
         let (g, s2) = (gpu.clone(), stop.clone());
-        // The session, its CUDA context and every CUDA call live on this one thread: a CUDA
-        // context is current on one thread at a time.
+        // The first buffer size: the display's. A process's frames may be another size; the
+        // buffers are made again when a frame does not fit.
+        let first_size = vblank
+            .as_ref()
+            .and_then(|v| unsafe { v.0.GetDesc() }.ok())
+            .map(|d| {
+                let r = d.DesktopCoordinates;
+                ((r.right - r.left) as u32, (r.bottom - r.top) as u32)
+            })
+            .unwrap_or((1920, 1080));
         let thread = std::thread::spawn(move || {
-            let setup = || -> Result<(Cuda, Session), String> {
-                let cuda = Cuda::load()?;
+            let load = || -> Result<(CreateEx, Dx9), String> {
                 let m = load_nvfbc()?;
-                let create: CreateEx = unsafe { sym(m, s!("NvFBC_CreateEx"))? };
-                let mut p: CreateParams = unsafe { std::mem::zeroed() };
-                p.version = struct_version(std::mem::size_of::<CreateParams>(), 2);
-                p.interface_type = INTERFACE_CUDA;
-                p.adapter_idx = adapter;
-                p.private_data = KEY.as_ptr().cast();
-                p.private_data_size = std::mem::size_of_val(&KEY) as u32;
-                let r = unsafe { create(&mut p) };
-                if r != 0 || p.object.is_null() {
-                    return Err(format!("creating the session: {}", nvfbc_error(r)));
-                }
-                let mut session = Session { object: p.object, buffer: 0 };
-                unsafe {
-                    // NvFBC created a CUDA context and made it current here; keep it current.
-                    let mut ctx = std::ptr::null_mut();
-                    cu((cuda.ctx_pop)(&mut ctx), "context pop")?;
-                    cu((cuda.ctx_push)(ctx), "context push")?;
-                    let max_size: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32 = session.slot(SLOT_MAX_BUFFER_SIZE);
-                    let mut bytes = 0u32;
-                    let r = max_size(session.object, &mut bytes);
-                    if r != 0 {
-                        return Err(format!("buffer size: {}", nvfbc_error(r)));
-                    }
-                    cu((cuda.mem_alloc)(&mut session.buffer, bytes as usize), "allocation")?;
-                    let setup_fn: unsafe extern "system" fn(*mut c_void, *mut CudaSetupParams) -> i32 = session.slot(SLOT_SETUP);
-                    let mut sp: CudaSetupParams = std::mem::zeroed();
-                    sp.version = struct_version(std::mem::size_of::<CudaSetupParams>(), 1);
-                    sp.format = FORMAT_ARGB;
-                    let r = setup_fn(session.object, &mut sp);
-                    if r != 0 {
-                        return Err(format!("setup: {}", nvfbc_error(r)));
-                    }
-                }
-                Ok((cuda, session))
+                Ok((unsafe { sym(m, s!("NvFBC_CreateEx"))? }, Dx9::new(g.luid)?))
             };
-            let (cuda, session) = match setup() {
+            let (create, dx9) = match load() {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = tx.send(Err(e));
                     return;
                 }
             };
-            let pace = Pace { vblank, interval: 10_000_000 / fps.max(1) as i64, cursor };
-            run(&g, &cuda, session, &pace, &latest, &s2, tx);
+            let pace = Pace { vblank, interval: 10_000_000 / fps.max(1) as i64 };
+            run(&g, &dx9, create, source, cursor, first_size, &pace, &latest, &s2, tx);
         });
         match rx.recv() {
             Ok(Ok(size)) => Ok(NvfbcCapture { size, stop, thread: Some(thread) }),
@@ -384,19 +541,19 @@ impl NvfbcCapture {
     }
 }
 
-/// When and how the capture thread grabs.
+/// When the capture thread grabs.
 struct Pace {
     vblank: Option<VBlank>,
     /// The shortest time between grabs, in 100 ns ticks (one output frame).
     interval: i64,
-    cursor: bool,
 }
 
 impl Pace {
-    /// Waits for the next vertical blank at least three quarters of a frame after `last` (a
-    /// 144 Hz display recorded at 60 fps is grabbed on every second or third blank), or without a
-    /// usable output, until a whole frame has passed.
-    fn wait(&self, last: i64) {
+    /// Waits for the first vertical blank at or after `due` (less an eighth of a frame for
+    /// jitter), or without a usable output, until `due` itself; returns the time. Grabs fall on a
+    /// grid of one per output frame, so a 240 Hz display recorded at 60 fps is grabbed on every
+    /// fourth blank: each grab costs the game GPU time, so there are no spare ones.
+    fn wait(&self, due: i64) -> i64 {
         loop {
             let ok = match &self.vblank {
                 Some(v) => unsafe { v.0.WaitForVBlank() }.is_ok(),
@@ -404,53 +561,102 @@ impl Pace {
             };
             let now = clock::now();
             if !ok {
-                let left = last + self.interval - now;
-                if left > 0 {
-                    std::thread::sleep(std::time::Duration::from_nanos(left as u64 * 100));
+                if due > now {
+                    std::thread::sleep(std::time::Duration::from_nanos((due - now) as u64 * 100));
                 }
-                return;
+                return clock::now();
             }
-            if now - last >= self.interval * 3 / 4 {
-                return;
+            if now >= due - self.interval / 8 {
+                return now;
             }
         }
     }
 }
 
-/// The capture loop: wait for the next grab time, grab, copy into the registered texture, publish.
+/// The capture loop: wait for the next grab time, grab into the next buffer, wait for the GPU to
+/// finish it, publish.
+#[allow(clippy::too_many_arguments)]
 fn run(
     gpu: &Gpu,
-    cuda: &Cuda,
-    session: Session,
+    dx9: &Dx9,
+    create: CreateEx,
+    source: Source,
+    cursor: bool,
+    first_size: (u32, u32),
     pace: &Pace,
     latest: &Mutex<Latest>,
     stop: &AtomicBool,
     ready: mpsc::Sender<Result<(u32, u32), String>>,
 ) {
-    let grab: unsafe extern "system" fn(*mut c_void, *mut CudaGrabParams) -> i32 = unsafe { session.slot(SLOT_GRAB) };
-    let mut target: Option<Target> = None;
     let mut ready = Some(ready);
+    let mut session: Option<Session> = None;
+    let mut buffers: Vec<Buffer> = Vec::new();
+    let mut size = first_size;
+    let mut next = 0usize;
     let mut failures = 0;
-    let mut last = i64::MIN / 2;
+    let mut due = clock::now();
+    let (started, mut grabs) = (due, 0u64);
     while !stop.load(Ordering::Relaxed) {
-        pace.wait(last);
-        last = clock::now();
+        if session.is_none() {
+            let opened = (|| -> Result<Session, String> {
+                if buffers.is_empty() {
+                    buffers = make_buffers(gpu, dx9, size)?;
+                }
+                let s = Session::open(create, dx9, source)?;
+                if let Err(e) = s.setup(&buffers, cursor) {
+                    s.close();
+                    return Err(e);
+                }
+                Ok(s)
+            })();
+            match opened {
+                Ok(s) => {
+                    if ready.is_none() {
+                        eprintln!("rbuf: NvFBC is capturing {} again", describe(source));
+                    }
+                    session = Some(s);
+                    failures = 0;
+                }
+                Err(e) => {
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+            }
+        }
+        let s = session.as_ref().unwrap();
+
+        let last = pace.wait(due);
+        due += pace.interval;
+        if last - due > pace.interval {
+            // More than a frame behind (a stall): start the grid again from now.
+            due = last + pace.interval;
+        }
         // SAFETY: plain integers; all zero is the documented initial state.
         let mut info: GrabInfo = unsafe { std::mem::zeroed() };
-        let mut gp: CudaGrabParams = unsafe { std::mem::zeroed() };
-        gp.version = struct_version(std::mem::size_of::<CudaGrabParams>(), 1);
-        gp.flags = GRAB_NOWAIT | if pace.cursor { GRAB_WITH_CURSOR } else { 0 };
-        gp.buffer = session.buffer;
-        gp.info = &mut info;
-        let r = unsafe { grab(session.object, &mut gp) };
-        let time = last;
+        let r = s.grab(next, &mut info);
+        grabs += 1;
         if r != 0 {
             failures += 1;
             if let Some(tx) = ready.take() {
-                let _ = tx.send(Err(format!("first frame: {}", nvfbc_error(r))));
-                break;
+                if failures >= 3 {
+                    let _ = tx.send(Err(format!("first frame: {}", nvfbc_error(r))));
+                    break;
+                }
+                ready = Some(tx);
+                continue;
             }
             if failures > 50 {
+                if matches!(source, Source::Process(_)) {
+                    // The process stopped presenting (or exited): wait for it with a new session.
+                    eprintln!("rbuf: NvFBC lost {} ({})", describe(source), nvfbc_error(r));
+                    session.take().unwrap().close();
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
                 eprintln!("rbuf: NvFBC capture stopped: {}", nvfbc_error(r));
                 break;
             }
@@ -459,70 +665,43 @@ fn run(
         }
         failures = 0;
         let (w, h) = (info.width, info.height);
-        let pitch = info.buffer_width.max(w) as usize * 4;
         if w == 0 || h == 0 {
             continue;
         }
-        let copied = (|| -> Result<ID3D11Texture2D, String> {
-            if target.as_ref().map(|t| super::d3d::texture_size(&t.texture)) != Some((w, h)) {
-                if let Some(t) = target.take() {
-                    unsafe { (cuda.unregister)(t.resource) };
-                }
-                let texture = gpu
-                    .texture(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_SHADER_RESOURCE)
-                    .map_err(|e| e.message().to_string())?;
-                let mut resource = std::ptr::null_mut();
-                cu(unsafe { (cuda.register)(&mut resource, texture.as_raw(), 0) }, "D3D11 registration")?;
-                target = Some(Target { texture, resource });
-            }
-            let t = target.as_mut().unwrap();
-            unsafe {
-                cu((cuda.map)(1, &mut t.resource, std::ptr::null_mut()), "map")?;
-                let mut array = 0usize;
-                let r = (cuda.mapped_array)(&mut array, t.resource, 0, 0);
-                let c = Memcpy2D {
-                    src_memory_type: CU_MEMORYTYPE_DEVICE,
-                    src_device: session.buffer,
-                    src_pitch: pitch,
-                    dst_memory_type: CU_MEMORYTYPE_ARRAY,
-                    dst_array: array,
-                    width_bytes: w as usize * 4,
-                    height: h as usize,
-                    ..Default::default()
-                };
-                // Queued on the default stream: no CPU wait. Unmapping orders the copy before any
-                // Direct3D use of the texture.
-                let r2 = if r == 0 { (cuda.memcpy_2d_async)(&c, std::ptr::null_mut()) } else { r };
-                cu((cuda.unmap)(1, &mut t.resource, std::ptr::null_mut()), "unmap")?;
-                cu(r2, "copy")?;
-            }
-            Ok(t.texture.clone())
-        })();
-        match copied {
-            Ok(tex) => {
-                super::capture::copy_into(gpu, latest, &tex, (w, h), time);
-                if let Some(tx) = ready.take() {
-                    let _ = tx.send(Ok((w, h)));
+        if w > size.0 || h > size.1 {
+            // Larger than the buffers (a game at a higher resolution than the display): make them
+            // again at the frame's size and register them; the next grab fills them.
+            size = (w.max(size.0), h.max(size.1));
+            match make_buffers(gpu, dx9, size).and_then(|b| s.setup(&b, cursor).map(|_| b)) {
+                Ok(b) => buffers = b,
+                Err(e) => {
+                    eprintln!("rbuf: NvFBC: {e}");
+                    session.take().unwrap().close();
+                    buffers.clear();
                 }
             }
-            Err(e) => {
-                if let Some(tx) = ready.take() {
-                    let _ = tx.send(Err(e));
-                } else {
-                    eprintln!("rbuf: NvFBC capture stopped: {e}");
-                }
-                break;
-            }
+            continue;
+        }
+        dx9.finish();
+        {
+            let mut l = latest.lock().unwrap();
+            l.texture = Some(buffers[next].texture.clone());
+            l.content = (w, h);
+            l.time = last;
+            l.seq += 1;
+        }
+        next = (next + 1) % buffers.len();
+        if let Some(tx) = ready.take() {
+            eprintln!("rbuf: NvFBC is capturing {}", describe(source));
+            let _ = tx.send(Ok((w, h)));
         }
     }
-    unsafe {
-        if let Some(t) = target.take() {
-            (cuda.unregister)(t.resource);
-        }
-        // Free the buffer before releasing the session; the session owns the CUDA context.
-        (cuda.mem_free)(session.buffer);
-        let release: unsafe extern "system" fn(*mut c_void) -> i32 = session.slot(SLOT_RELEASE);
-        release(session.object);
+    if std::env::var_os("RBUF_NVFBC_DEBUG").is_some() {
+        let secs = (clock::now() - started) as f64 / 1e7;
+        eprintln!("NvFBC: {grabs} grabs in {secs:.1} s ({:.1} per second)", grabs as f64 / secs);
+    }
+    if let Some(s) = session.take() {
+        s.close();
     }
 }
 
@@ -562,23 +741,30 @@ pub fn probe() -> Vec<String> {
     let Ok(create) = (unsafe { sym::<CreateEx>(m, s!("NvFBC_CreateEx")) }) else {
         return out;
     };
-    for (name, kind) in [("to system memory", 0x1204u32), ("to CUDA", INTERFACE_CUDA)] {
+    let dx9 = Dx9::new(LUID::default()).ok();
+    for (name, kind) in [("to system memory", INTERFACE_SYS), ("to Direct3D 9", INTERFACE_DX9)] {
         for keyed in [false, true] {
             for adapter in 0..2u32 {
                 let mut p: CreateParams = unsafe { std::mem::zeroed() };
                 p.version = struct_version(std::mem::size_of::<CreateParams>(), 2);
                 p.interface_type = kind;
                 p.adapter_idx = adapter;
+                if kind == INTERFACE_DX9 {
+                    match &dx9 {
+                        Some(d) => p.device = d.device.as_raw(),
+                        None => continue,
+                    }
+                }
                 if keyed {
                     p.private_data = KEY.as_ptr().cast();
                     p.private_data_size = 16;
                 }
                 let r = unsafe { create(&mut p) };
                 let verdict = if r == 0 && !p.object.is_null() {
-                    let s = Session { object: p.object, buffer: 0 };
-                    let slot = if kind == INTERFACE_CUDA { SLOT_RELEASE } else { 4 };
+                    let s = Session { object: p.object };
                     unsafe {
-                        let release: unsafe extern "system" fn(*mut c_void) -> i32 = s.slot(slot);
+                        let release: unsafe extern "system" fn(*mut c_void) -> i32 =
+                            s.slot(if kind == INTERFACE_DX9 { SLOT_RELEASE } else { SLOT_SYS_RELEASE });
                         release(s.object);
                     }
                     format!("ok, up to {}x{}", p.max_width, p.max_height)

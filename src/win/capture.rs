@@ -84,6 +84,8 @@ pub enum Target {
     Window(isize),
     /// Whatever window is in the foreground when capture starts.
     Focused,
+    /// A process by pid: what it presents (NvFBC only).
+    Process(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,12 +151,30 @@ impl Capture {
                 .ok_or_else(|| windows::core::Error::new(windows::core::HRESULT(-1), "no such monitor"))
         };
         if method == Method::Nvfbc {
-            let Target::Monitor(i) = target else {
-                return Err(windows::core::Error::new(windows::core::HRESULT(-1), "NvFBC captures monitors only"));
+            use super::nvfbc::Source;
+            use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+            use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+            // A window is captured through its process: NvFBC takes what the process presents.
+            let window_process = |h: HWND| -> Result<(Source, HMONITOR)> {
+                let mut pid = 0u32;
+                unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+                if pid == 0 {
+                    return Err(windows::core::Error::new(windows::core::HRESULT(-1), "no such window"));
+                }
+                Ok((Source::Process(pid), unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) }))
             };
-            let (ordinal, output) = find_output(monitor(*i)?);
+            let (source, mon) = match target {
+                Target::Monitor(i) => {
+                    let mon = monitor(*i)?;
+                    (Source::Display(find_output(mon).0), mon)
+                }
+                Target::Window(h) => window_process(HWND(*h as *mut _))?,
+                Target::Focused => window_process(unsafe { GetForegroundWindow() })?,
+                Target::Process(pid) => (Source::Process(*pid), monitor(None)?),
+            };
+            let (_, output) = find_output(mon);
             let vblank = output.map(super::nvfbc::VBlank);
-            let n = super::nvfbc::NvfbcCapture::start(gpu, ordinal, vblank, fps, cursor, latest.clone())
+            let n = super::nvfbc::NvfbcCapture::start(gpu, source, vblank, fps, cursor, latest.clone())
                 .map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e))?;
             return Ok(Capture { latest, size: n.size, _wgc: None, dxgi: None, _nvfbc: Some(n) });
         }
@@ -170,6 +190,12 @@ impl Capture {
                 Target::Monitor(i) => interop.CreateForMonitor(monitor(*i)?)?,
                 Target::Window(h) => interop.CreateForWindow(HWND(*h as *mut _))?,
                 Target::Focused => interop.CreateForWindow(GetForegroundWindow())?,
+                Target::Process(_) => {
+                    return Err(windows::core::Error::new(
+                        windows::core::HRESULT(-1),
+                        "a process can only be captured with NvFBC (an NVIDIA GPU)",
+                    ))
+                }
             }
         };
         let size = item.Size()?;

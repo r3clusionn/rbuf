@@ -103,7 +103,7 @@ fn colours_survive_nvfbc_capture() {
     if !ready() {
         return;
     }
-    if !rbuf::win::nvfbc::probe().iter().any(|l| l.contains("to CUDA, display 0, with key: ok")) {
+    if !rbuf::win::nvfbc::probe().iter().any(|l| l.contains("to Direct3D 9, display 0, with key: ok")) {
         eprintln!("SKIPPED: NvFBC is not available");
         return;
     }
