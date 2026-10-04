@@ -35,8 +35,8 @@ All three recorded the screen at the same settings, ShadowPlay's "High" preset r
 Requires Windows 10 2004 or later (Windows 11 for a capture without the yellow border), a GPU with a hardware video encoder, and a recent stable Rust (built with 1.98.1).
 
 ```sh
-git clone https://github.com/r3clusionn/replay-buffer
-cd replay-buffer
+git clone https://github.com/r3clusionn/rbuf
+cd rbuf
 cargo install --path .
 ```
 
