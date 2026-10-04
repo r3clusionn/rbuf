@@ -318,6 +318,7 @@ def main():
     results = []
     blocks = [[n for n in names if not CONDITIONS[n][0]], [n for n in names if CONDITIONS[n][0]]]
     sp_fps = spctl.get_fps()
+    was_running = spctl.service_running()
     if blocks[1]:
         spctl.set_fps(FPS)
     try:
@@ -326,6 +327,9 @@ def main():
         if blocks[1]:
             # Put the owner's setting back and restart the service so it reads it.
             spctl.set_fps(sp_fps)
+            spctl.restart_service()
+        elif was_running:
+            # The other block stops the NVIDIA App's service; leave it as it was found.
             spctl.restart_service()
     smi.stop()
     with open(os.path.join(OUT, f'bench_{load.replace(":", "").replace("+", "_")}_{FPS}fps_{int(time.time())}.json'), 'w') as f:

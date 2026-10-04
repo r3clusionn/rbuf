@@ -52,6 +52,11 @@ def restart_service():
     return False
 
 
+def service_running():
+    r = subprocess.run(['powershell', '-NoProfile', '-Command', '(Get-Service NvContainerLocalSystem).Status'], capture_output=True, text=True)
+    return r.stdout.strip() == 'Running'
+
+
 def stop_service():
     subprocess.run(['powershell', '-NoProfile', '-Command', 'Stop-Service NvContainerLocalSystem -Force'], check=True)
 
