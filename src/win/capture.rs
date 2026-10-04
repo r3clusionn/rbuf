@@ -151,29 +151,7 @@ impl Capture {
                 .ok_or_else(|| windows::core::Error::new(windows::core::HRESULT(-1), "no such monitor"))
         };
         if method == Method::Nvfbc {
-            use super::nvfbc::Source;
-            use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
-            use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
-            // A window is captured through its process: NvFBC takes what the process presents.
-            let window_process = |h: HWND| -> Result<(Source, HMONITOR)> {
-                let mut pid = 0u32;
-                unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
-                if pid == 0 {
-                    return Err(windows::core::Error::new(windows::core::HRESULT(-1), "no such window"));
-                }
-                Ok((Source::Process(pid), unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) }))
-            };
-            let (source, mon) = match target {
-                Target::Monitor(i) => {
-                    let mon = monitor(*i)?;
-                    (Source::Display(find_output(mon).0), mon)
-                }
-                Target::Window(h) => window_process(HWND(*h as *mut _))?,
-                Target::Focused => window_process(unsafe { GetForegroundWindow() })?,
-                Target::Process(pid) => (Source::Process(*pid), monitor(None)?),
-            };
-            let (_, output) = find_output(mon);
-            let vblank = output.map(super::nvfbc::VBlank);
+            let (source, vblank) = nvfbc_source(target)?;
             let n = super::nvfbc::NvfbcCapture::start(gpu, source, vblank, fps, cursor, latest.clone())
                 .map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e))?;
             return Ok(Capture { latest, size: n.size, _wgc: None, dxgi: None, _nvfbc: Some(n) });
@@ -290,6 +268,41 @@ impl Capture {
             Ok(Capture { latest, size, _wgc: None, dxgi: Some((stop, handle)), _nvfbc: None })
         }
     }
+}
+
+/// What NvFBC captures for `target`, and the display output whose vertical blanks pace it. A
+/// window is captured through its process: NvFBC takes what the process presents.
+pub fn nvfbc_source(target: &Target) -> Result<(super::nvfbc::Source, Option<super::nvfbc::VBlank>)> {
+    use super::nvfbc::Source;
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let mons = monitors();
+    let monitor = |i: Option<usize>| -> Result<HMONITOR> {
+        let m = match i {
+            Some(i) => mons.get(i),
+            None => mons.iter().find(|m| m.primary).or(mons.first()),
+        };
+        m.map(|m| HMONITOR(m.handle as *mut _))
+            .ok_or_else(|| windows::core::Error::new(windows::core::HRESULT(-1), "no such monitor"))
+    };
+    let window_process = |h: HWND| -> Result<(Source, HMONITOR)> {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        if pid == 0 {
+            return Err(windows::core::Error::new(windows::core::HRESULT(-1), "no such window"));
+        }
+        Ok((Source::Process(pid), unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) }))
+    };
+    let (source, mon) = match target {
+        Target::Monitor(i) => {
+            let mon = monitor(*i)?;
+            (Source::Display(find_output(mon).0), mon)
+        }
+        Target::Window(h) => window_process(HWND(*h as *mut _))?,
+        Target::Focused => window_process(unsafe { GetForegroundWindow() })?,
+        Target::Process(pid) => (Source::Process(*pid), monitor(None)?),
+    };
+    Ok((source, find_output(mon).1.map(super::nvfbc::VBlank)))
 }
 
 /// The display's position in DXGI's enumeration of outputs over all adapters, which is the

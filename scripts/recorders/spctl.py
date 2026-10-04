@@ -30,6 +30,15 @@ def set_f32(name, v):
     set_bin(name, struct.pack('<f', v))
 
 
+def get_fps():
+    """The recording frame rate (a float in REG_BINARY); the service reads it when it starts."""
+    return struct.unpack('<f', get('RecordingFPS'))[0]
+
+
+def set_fps(fps):
+    set_f32('RecordingFPS', float(fps))
+
+
 def restart_service():
     subprocess.run(['powershell', '-NoProfile', '-Command', 'Restart-Service NvContainerLocalSystem -Force'], check=True)
     # The overlay and its capture helper come up some seconds later.

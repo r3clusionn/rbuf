@@ -7,5 +7,6 @@ pub mod control;
 pub mod convert;
 pub mod d3d;
 pub mod encoder;
+pub mod nvenc;
 pub mod nvfbc;
 pub mod recorder;

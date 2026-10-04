@@ -14,7 +14,8 @@
 //!
 //! `exclusive` and `legacy` switch to exclusive full screen (flip model and blit model).
 //! `skip:S` leaves the first S seconds out of the printed figures; `trace` also prints each
-//! second's rate to stderr.
+//! second's rate to stderr. `vsync` presents once per refresh, so every frame the display shows
+//! is one colour whose red channel steps by one (mod 256): a test pattern for capture timing.
 
 #[cfg(not(windows))]
 fn main() {}
@@ -86,7 +87,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
     // `exclusive`: DXGI exclusive full screen on a flip-model swap chain; `legacy`: the old
     // blit-model exclusive full screen (Legacy Flip once Windows' full-screen optimisations are
     // off for the program).
-    let (mut exclusive, mut legacy) = (false, false);
+    let (mut exclusive, mut legacy, mut vsync) = (false, false, false);
     for (i, a) in std::env::args().skip(1).enumerate() {
         if i == 0 {
             secs = a.parse().unwrap_or(10.0);
@@ -96,6 +97,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
             (exclusive, legacy) = (true, true);
         } else if a == "trace" {
             trace = true;
+        } else if a == "vsync" {
+            vsync = true;
         } else if let Some(n) = a.strip_prefix("heavy:") {
             heavy = n.parse().unwrap_or(400);
         } else if let Some(n) = a.strip_prefix("skip:") {
@@ -206,7 +209,11 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
                     context.Draw(3, 0);
                 }
             }
-            let hr = swap.Present(0, if exclusive { DXGI_PRESENT(0) } else { DXGI_PRESENT_ALLOW_TEARING });
+            let hr = if vsync {
+                swap.Present(1, DXGI_PRESENT(0))
+            } else {
+                swap.Present(0, if exclusive { DXGI_PRESENT(0) } else { DXGI_PRESENT_ALLOW_TEARING })
+            };
             if hr.is_err() || hr.0 != 0 {
                 *bad.entry(hr.0).or_insert(0u64) += 1;
             }

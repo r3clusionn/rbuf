@@ -14,12 +14,16 @@ it stopped, so its in-game overlay hook does not touch them.
     245 fps), heavy:200+exclusive (exclusive full screen; Legacy Flip once full-screen
     optimisations are off for game.exe), light
 
+BENCH_FPS=120 records at 120 fps instead of 60, at ShadowPlay's "High" bitrate for that rate (27
+Mbit/s, 54 max). ShadowPlay's own frame rate setting is switched to the same rate for the run and
+put back afterwards.
+
 Needs: an administrator prompt (it stops and starts NvContainerLocalSystem), `cargo build --release
 --examples`, `pip install psutil websocket-client`, nvidia-smi and ffprobe on PATH, PresentMon 2.x
 (`PRESENTMON=path`), OBS Studio 30+ (`OBS_STUDIO=folder`; run in portable mode with its own
-configuration, see obs_setup.py), and the NVIDIA App with ShadowPlay set to 60 fps and the High
-quality preset (H.264, VBR 16 Mbit/s at 1080p60, read from its CaptureCore.log), manual recording
-on Alt+F9.
+configuration, see obs_setup.py), and the NVIDIA App with ShadowPlay set to the High quality
+preset (H.264, VBR 16 Mbit/s at 1080p60 and 27 Mbit/s at 1080p120, read from its CaptureCore.log),
+manual recording on Alt+F9.
 """
 import json
 import os
@@ -40,6 +44,9 @@ RBUF = os.path.join(PROJ, 'target', 'release', 'rbuf.exe')
 OUT = os.path.join(PROJ, 'target', 'recorders')
 os.makedirs(OUT, exist_ok=True)
 SECONDS, SKIP = 25, 8
+FPS = int(os.environ.get('BENCH_FPS', '60'))
+# ShadowPlay's "High" preset at 1080p (its CaptureCore.log): kbit/s by frame rate.
+KBPS = {60: 16000, 120: 27000}[FPS]
 XPERF = os.environ.get('XPERF', r'C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe')
 TRACE = os.environ.get('BENCH_XPERF') == '1'
 
@@ -127,17 +134,17 @@ def probe(path):
 class Rbuf:
     family = 'rbuf'
 
-    def __init__(self, capture, target=('-w', 'screen')):
-        self.capture, self.target = capture, list(target)
+    def __init__(self, capture, target=('-w', 'screen'), env=None):
+        self.capture, self.target, self.env = capture, list(target), env
 
     def prepare(self):
         pass
 
     def start(self, tag):
         self.path = os.path.join(OUT, f'{tag}.mp4')
-        self.p = subprocess.Popen([RBUF] + self.target + ['-capture', self.capture, '-f', '60', '-k', 'h264', '-bm', 'vbr', '-q', '16000',
+        self.p = subprocess.Popen([RBUF] + self.target + ['-capture', self.capture, '-f', str(FPS), '-k', 'h264', '-bm', 'vbr', '-q', str(KBPS),
                                    '-gop', '1', '-a', 'default_output', '-o', self.path],
-                                  stderr=subprocess.PIPE, text=True)
+                                  stderr=subprocess.PIPE, text=True, env={**os.environ, **(self.env or {})})
 
     def stop(self):
         subprocess.run([RBUF, 'stop'], capture_output=True)
@@ -159,7 +166,7 @@ class Obs:
         self.source = source
 
     def prepare(self):
-        subprocess.run(['python', os.path.join(HERE, 'obs_setup.py'), '16000', 'p4', 'vbr'], check=True, capture_output=True)
+        subprocess.run(['python', os.path.join(HERE, 'obs_setup.py'), str(KBPS), 'p4', 'vbr', str(FPS)], check=True, capture_output=True)
         self.proc = obsctl.launch()
         self.o = obsctl.Obs()
         if self.source == 'display':
@@ -229,6 +236,8 @@ class Nothing:
 CONDITIONS = {
     'none': (False, lambda: Nothing()),
     'rbuf-nvfbc': (False, lambda: Rbuf('nvfbc')),
+    # NvFBC through rbuf's general path (ARGB grab, compute shader, Media Foundation encoder).
+    'rbuf-general': (False, lambda: Rbuf('nvfbc', env={'RBUF_GENERAL_PATH': '1'})),
     'rbuf-wgc': (False, lambda: Rbuf('wgc')),
     'rbuf-process': (False, lambda: Rbuf('nvfbc', ['-w', 'process:game.exe'])),
     'obs-display': (False, lambda: Obs('display')),
@@ -308,6 +317,22 @@ def main():
     smi = Smi()
     results = []
     blocks = [[n for n in names if not CONDITIONS[n][0]], [n for n in names if CONDITIONS[n][0]]]
+    sp_fps = spctl.get_fps()
+    if blocks[1]:
+        spctl.set_fps(FPS)
+    try:
+        run_all(load, rounds, blocks, smi, results)
+    finally:
+        if blocks[1]:
+            # Put the owner's setting back and restart the service so it reads it.
+            spctl.set_fps(sp_fps)
+            spctl.restart_service()
+    smi.stop()
+    with open(os.path.join(OUT, f'bench_{load.replace(":", "").replace("+", "_")}_{FPS}fps_{int(time.time())}.json'), 'w') as f:
+        json.dump(results, f, indent=1)
+
+
+def run_all(load, rounds, blocks, smi, results):
     for rnd in range(rounds):
         for need_service, block in zip((False, True), blocks):
             if not block:
@@ -321,9 +346,6 @@ def main():
             for name in block[k:] + block[:k]:
                 results.append(run_one(name, load, smi, rnd))
                 time.sleep(2)
-    smi.stop()
-    with open(os.path.join(OUT, f'bench_{load.replace(":", "").replace("+", "_")}_{int(time.time())}.json'), 'w') as f:
-        json.dump(results, f, indent=1)
 
 
 if __name__ == '__main__':

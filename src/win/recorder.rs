@@ -25,6 +25,7 @@ use super::control::{self, Cmd};
 use super::convert::{self, Converter, Nv12};
 use super::d3d::Gpu;
 use super::encoder::{Encoded, Encoder, Input, RateControl, Settings};
+use super::nvfbc::{DirectOptions, NvfbcEncoder};
 use crate::args::{self, BitrateMode, Options, Quality, Window};
 use crate::mp4::{Mp4Writer, TrackKind, TrackSpec, VideoCodec};
 use crate::ring::{Packet, Ring, Snapshot};
@@ -246,51 +247,9 @@ fn start_capture(
     Ok((Capture::start(gpu, target, method, fps, cursor).map_err(e)?, method))
 }
 
-pub fn run(o: Options) -> Result<(), String> {
-    let e = |x: windows::core::Error| x.message().to_string();
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
-    let target = resolve_target(&o.window)?;
-    let sources: Vec<Source> = o.audio.iter().map(|a| Source::parse(a)).collect::<Result<_, _>>()?;
-    let gpu = Gpu::new(o.adapter).map_err(e)?;
-    let (cap, method) = start_capture(&gpu, &target, o.capture, o.fps, o.cursor)?;
-    // NvFBC's grabs and rbuf's conversion and encoding are a few small GPU jobs per frame. Under a
-    // game that keeps the GPU busy with long frames they wait behind it at normal priority:
-    // measured with a 245 fps full-screen game, the encoder then got 1 to 6 frames a second. At
-    // the realtime scheduling class all 60 arrive and the game's rate does not change. Windows
-    // Graphics Capture does not need it (the compositor captures) and loses game frames with it,
-    // so only NvFBC gets it (README).
-    if method == Method::Nvfbc {
-        if let Err(status) = super::d3d::raise_gpu_priority() {
-            eprintln!("rbuf: could not raise the GPU scheduling priority (0x{status:08x}); a GPU-bound game may starve the recording");
-        }
-    }
-    // Wait for the first frame (Windows Graphics Capture sends one at once; duplication when the screen changes).
-    let t0 = Instant::now();
-    while cap.latest.lock().unwrap().seq == 0 && t0.elapsed() < Duration::from_secs(3) {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let (cw, ch) = {
-        let l = cap.latest.lock().unwrap();
-        if l.seq > 0 {
-            l.content
-        } else {
-            cap.size
-        }
-    };
-    let (w, h) = o.size.unwrap_or((cw & !1, ch & !1));
-    if !convert::nv12_uav_supported(&gpu) {
-        return Err(format!(
-            "{} cannot write NV12 from a compute shader (typed UAV store); this GPU is not supported yet",
-            gpu.adapter_name
-        ));
-    }
-    let codec = codec_of(o.codec);
-    let mut conv = Converter::new(&gpu, w, h).map_err(e)?;
-    let pool: Vec<Nv12> = (0..8).map(|_| conv.target()).collect::<Result<_, _>>().map_err(e)?;
-
-    let (bitrate, rc) = match (&o.quality, o.bitrate_mode) {
+/// Encoder settings for the output size `(w, h)` from the command line.
+fn video_settings(o: &Options, (w, h): (u32, u32)) -> Settings {
+    let (bitrate, rate_control) = match (&o.quality, o.bitrate_mode) {
         (Quality::Number(q), BitrateMode::Qp) => {
             (args::preset_bitrate("very_high", o.codec, w, h, o.fps), RateControl::Quality(*q))
         }
@@ -311,45 +270,118 @@ pub fn run(o: Options) -> Result<(), String> {
         ),
     };
     let gop = ((o.fps as f64 * o.gop_seconds).round() as u32).max(1);
-    let enc =
-        Encoder::new(&gpu, Settings { codec, width: w, height: h, fps: o.fps, bitrate, rate_control: rc, gop }).map_err(e)?;
+    Settings { codec: codec_of(o.codec), width: w, height: h, fps: o.fps, bitrate, rate_control, gop }
+}
+
+/// The video side, from capture to encoded pictures.
+enum Pipeline {
+    /// NvFBC writing NV12 straight into NVENC's surfaces, on one thread (`nvfbc::NvfbcEncoder`).
+    Direct(NvfbcEncoder),
+    /// Any capture method into one texture, the pacer converting it to NV12 at the output frame
+    /// rate, and the vendor's Media Foundation encoder.
+    General { cap: Capture, pacer: std::thread::JoinHandle<()>, encoder: std::thread::JoinHandle<windows::core::Result<()>> },
+}
+
+impl Pipeline {
+    /// Stops producing and waits until every picture in flight has been handed on.
+    fn finish(self, stop: &AtomicBool) -> Result<(), String> {
+        stop.store(true, Ordering::Relaxed);
+        match self {
+            Pipeline::Direct(d) => {
+                drop(d);
+                Ok(())
+            }
+            Pipeline::General { cap, pacer, encoder } => {
+                let _ = pacer.join();
+                let r = encoder.join().map_err(|_| "encoder thread panicked".to_string())?.map_err(|x| x.message().to_string());
+                drop(cap);
+                r
+            }
+        }
+    }
+}
+
+/// Counters shared with the video threads: frames encoded, repeated, dropped.
+type Stats = Arc<[AtomicU64; 3]>;
+
+/// Starts the video side. NvFBC goes straight into NVENC when it can (the cheapest path); anything
+/// else, or a failure there, takes the general path.
+fn start_video(
+    gpu: &Gpu,
+    target: &Target,
+    o: &Options,
+    stop: &Arc<AtomicBool>,
+    force_key: &Arc<AtomicBool>,
+    stats: &Stats,
+    out: mpsc::Sender<Encoded>,
+) -> Result<(Pipeline, Method, (u32, u32), String), String> {
+    let e = |x: windows::core::Error| x.message().to_string();
+    let nvfbc = match o.capture {
+        args::CaptureMethod::Auto => matches!(target, Target::Monitor(_) | Target::Process(_)),
+        args::CaptureMethod::Nvfbc => true,
+        _ => false,
+    };
+    if nvfbc && std::env::var_os("RBUF_GENERAL_PATH").is_none() {
+        let started = capture::nvfbc_source(target).map_err(e).and_then(|(source, vblank)| {
+            let o2 = o.clone();
+            NvfbcEncoder::start(
+                gpu,
+                source,
+                vblank,
+                DirectOptions {
+                    fps: o.fps,
+                    cursor: o.cursor,
+                    size: o.size,
+                    settings: Box::new(move |size| video_settings(&o2, size)),
+                    force_key: force_key.clone(),
+                    stats: stats.clone(),
+                    out: out.clone(),
+                },
+            )
+        });
+        match started {
+            Ok(d) => {
+                raise_priority();
+                let size = d.size;
+                return Ok((Pipeline::Direct(d), Method::Nvfbc, size, "NVENC (Video Codec SDK)".into()));
+            }
+            // NvFBC itself is missing or busy: the general path tries it again and says so.
+            Err(x) if !x.contains("NVENC") && !x.contains("NV12") => {}
+            Err(x) => eprintln!("rbuf: NvFBC straight to NVENC failed ({x}); using the general path"),
+        }
+    }
+
+    let (cap, method) = start_capture(gpu, target, o.capture, o.fps, o.cursor)?;
+    if method == Method::Nvfbc {
+        raise_priority();
+    }
+    // Wait for the first frame (Windows Graphics Capture sends one at once; duplication when the screen changes).
+    let t0 = Instant::now();
+    while cap.latest.lock().unwrap().seq == 0 && t0.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (cw, ch) = {
+        let l = cap.latest.lock().unwrap();
+        if l.seq > 0 {
+            l.content
+        } else {
+            cap.size
+        }
+    };
+    let (w, h) = o.size.unwrap_or((cw & !1, ch & !1));
+    if !convert::nv12_uav_supported(gpu) {
+        return Err(format!(
+            "{} cannot write NV12 from a compute shader (typed UAV store); this GPU is not supported yet",
+            gpu.adapter_name
+        ));
+    }
+    let mut conv = Converter::new(gpu, w, h).map_err(e)?;
+    let pool: Vec<Nv12> = (0..8).map(|_| conv.target()).collect::<Result<_, _>>().map_err(e)?;
+    let enc = Encoder::new(gpu, video_settings(o, (w, h))).map_err(e)?;
     let enc_name = enc.name.clone();
-
-    let (tx, rx) = mpsc::channel::<Msg>();
-    // Audio first, so a missing app fails before anything else runs.
-    let mut audio_caps = Vec::new();
-    for (i, s) in sources.iter().enumerate() {
-        let (atx, arx) = mpsc::channel::<AacFrame>();
-        audio_caps.push(AudioCapture::start(s.clone(), atx).map_err(|x| format!("audio source {}: {}", s.label(), x.message()))?);
-        let t = tx.clone();
-        std::thread::spawn(move || {
-            while let Ok(f) = arx.recv() {
-                if t.send(Msg::Audio(i, f)).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
-    // Encoder thread and its forwarder.
     let (ftx, frx) = mpsc::sync_channel::<Input>(1);
-    let (vtx, vrx) = mpsc::channel::<Encoded>();
-    let enc_thread = std::thread::spawn(move || enc.run(frx, vtx));
-    {
-        let t = tx.clone();
-        std::thread::spawn(move || {
-            while let Ok(v) = vrx.recv() {
-                if t.send(Msg::Video(v)).is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    let encoder = std::thread::spawn(move || enc.run(frx, out));
 
-    // Pacer.
-    let stop = Arc::new(AtomicBool::new(false));
-    let force_key = Arc::new(AtomicBool::new(false));
-    let stats = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]); // encoded, repeated, dropped
     let fps = o.fps as i64;
     let cfr = o.cfr;
     let wait_fresh = method == Method::Nvfbc;
@@ -422,6 +454,64 @@ pub fn run(o: Options) -> Result<(), String> {
             drop(ftx);
         })
     };
+    Ok((Pipeline::General { cap, pacer, encoder }, method, (w, h), enc_name))
+}
+
+/// NvFBC's grabs and rbuf's encoding are a few small GPU jobs per frame. Under a game that keeps
+/// the GPU busy with long frames they wait behind it at normal priority: measured with a 245 fps
+/// full-screen game, the encoder then got 1 to 6 frames a second. At the realtime scheduling class
+/// all 60 arrive and the game's rate does not change. Windows Graphics Capture does not need it
+/// (the compositor captures) and loses game frames with it, so only NvFBC gets it (README).
+fn raise_priority() {
+    if let Err(status) = super::d3d::raise_gpu_priority() {
+        eprintln!(
+            "rbuf: could not raise the GPU scheduling priority (0x{status:08x}); a GPU-bound game may starve the recording"
+        );
+    }
+}
+
+pub fn run(o: Options) -> Result<(), String> {
+    let e = |x: windows::core::Error| x.message().to_string();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let target = resolve_target(&o.window)?;
+    let sources: Vec<Source> = o.audio.iter().map(|a| Source::parse(a)).collect::<Result<_, _>>()?;
+    let gpu = Gpu::new(o.adapter).map_err(e)?;
+    let codec = codec_of(o.codec);
+    let stop = Arc::new(AtomicBool::new(false));
+    let force_key = Arc::new(AtomicBool::new(false));
+    let stats: Stats = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
+    let (vtx, vrx) = mpsc::channel::<Encoded>();
+    let (video_pipeline, method, (w, h), enc_name) = start_video(&gpu, &target, &o, &stop, &force_key, &stats, vtx)?;
+    let Settings { bitrate, rate_control: rc, .. } = video_settings(&o, (w, h));
+    let cfr = o.cfr;
+    let fps = o.fps as i64;
+
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let mut audio_caps = Vec::new();
+    for (i, s) in sources.iter().enumerate() {
+        let (atx, arx) = mpsc::channel::<AacFrame>();
+        audio_caps.push(AudioCapture::start(s.clone(), atx).map_err(|x| format!("audio source {}: {}", s.label(), x.message()))?);
+        let t = tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(f) = arx.recv() {
+                if t.send(Msg::Audio(i, f)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let t = tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(v) = vrx.recv() {
+                if t.send(Msg::Video(v)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     control::listen_ctrl_c({
         let (ctx, crx) = mpsc::channel();
@@ -653,10 +743,8 @@ pub fn run(o: Options) -> Result<(), String> {
     }
 
     // Shut down in order: stop producing, let the encoder drain, then write what is left.
-    stop.store(true, Ordering::Relaxed);
-    let _ = pacer.join();
+    let enc_result = video_pipeline.finish(&stop);
     drop(audio_caps);
-    let enc_result = enc_thread.join().map_err(|_| "encoder thread panicked".to_string())?;
     drop(tx);
     while let Ok(m) = rx.recv_timeout(Duration::from_millis(500)) {
         match m {
@@ -693,7 +781,5 @@ pub fn run(o: Options) -> Result<(), String> {
     if o.verbose {
         eprintln!("rbuf: {} frames encoded, {} repeated, {} dropped", s[0], s[1], s[2]);
     }
-    enc_result.map_err(e)?;
-    drop(cap);
-    Ok(())
+    enc_result
 }

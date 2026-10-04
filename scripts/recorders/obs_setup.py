@@ -1,8 +1,8 @@
 """Writes a portable OBS configuration for the benchmark: profile "Bench" (advanced output, NVENC
-H.264 CBR, 1920x1080 at 60 fps, one desktop audio track, MP4), an empty scene collection "Bench"
+H.264, 1920x1080 at 60 fps (or the given rate), one desktop audio track, MP4), an empty scene collection "Bench"
 (the harness adds sources over obs-websocket), and obs-websocket on port 4455 without a password.
 
-    python obs_setup.py [bitrate_kbps] [preset] [cbr|vbr]
+    python obs_setup.py [bitrate_kbps] [preset] [cbr|vbr] [fps]
 """
 import json
 import os
@@ -11,6 +11,7 @@ import sys
 kbps = int(sys.argv[1]) if len(sys.argv) > 1 else 20000
 preset = sys.argv[2] if len(sys.argv) > 2 else 'p5'
 rc = (sys.argv[3] if len(sys.argv) > 3 else 'cbr').upper()
+fps = int(sys.argv[4]) if len(sys.argv) > 4 else 60
 # Portable mode: the configuration lives next to OBS, so a normal OBS setup is left alone.
 root = os.path.join(os.environ.get('OBS_STUDIO', r'C:\Program Files\obs-studio'), 'config', 'obs-studio')
 # OBS reads backslash escapes in its ini files, so the path uses forward slashes.
@@ -83,8 +84,8 @@ BaseCY=1080
 OutputCX=1920
 OutputCY=1080
 FPSType=1
-FPSInt=60
-FPSCommon=60
+FPSInt={fps}
+FPSCommon={fps}
 ScaleType=bicubic
 ColorFormat=NV12
 ColorSpace=709

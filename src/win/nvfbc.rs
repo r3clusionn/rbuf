@@ -24,7 +24,7 @@
 //! back to Windows Graphics Capture.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -35,10 +35,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Direct3D9::{
-    Direct3DCreate9Ex, IDirect3DDevice9Ex, IDirect3DQuery9, IDirect3DSurface9, IDirect3DTexture9, D3DCREATE_FPU_PRESERVE,
-    D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DCREATE_NOWINDOWCHANGES, D3DDEVTYPE_HAL, D3DFMT_A8R8G8B8,
-    D3DFMT_UNKNOWN, D3DGETDATA_FLUSH, D3DISSUE_END, D3DPOOL_DEFAULT, D3DPRESENT_PARAMETERS, D3DQUERYTYPE_EVENT, D3DSWAPEFFECT_DISCARD,
-    D3DUSAGE_RENDERTARGET, D3D_SDK_VERSION,
+    Direct3DCreate9Ex, IDirect3DDevice9Ex, IDirect3DQuery9, IDirect3DSurface9, IDirect3DTexture9,
+    D3DCREATE_DISABLE_PSGP_THREADING, D3DCREATE_FPU_PRESERVE, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED,
+    D3DCREATE_NOWINDOWCHANGES, D3DDEVTYPE_HAL, D3DFMT_A8R8G8B8, D3DFMT_UNKNOWN, D3DFORMAT, D3DGETDATA_FLUSH, D3DISSUE_END,
+    D3DPOOL_DEFAULT, D3DPRESENT_PARAMETERS, D3DQUERYTYPE_EVENT, D3DSWAPEFFECT_DISCARD, D3DUSAGE_RENDERTARGET, D3D_SDK_VERSION,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{IDXGIOutput, IDXGIResource};
@@ -48,6 +48,8 @@ use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
 use super::capture::Latest;
 use super::clock;
 use super::d3d::Gpu;
+use super::encoder::{Encoded, Settings};
+use super::nvenc::{Matrix, Nvenc};
 
 const DLL_VERSION: u32 = 0x70;
 
@@ -65,6 +67,11 @@ const INTERFACE_DX9: u32 = 0x2003;
 const INTERFACE_SYS: u32 = 0x1204;
 /// `NVFBC_TODX9VID_ARGB`: 8-bit B, G, R, A, the layout of `DXGI_FORMAT_B8G8R8A8_UNORM`.
 const MODE_ARGB: u32 = 0;
+/// `NVFBC_TODX9VID_NV12`: the driver converts to NV12 itself, into NV12 surfaces.
+const MODE_NV12: u32 = 1;
+/// Grab modes: the whole frame as it is, or scaled to the target size.
+const GRAB_FULL: u32 = 0;
+const GRAB_SCALE: u32 = 1;
 /// Setup flag bit 0: draw the hardware cursor into the frame.
 const SETUP_WITH_CURSOR: u32 = 0x1;
 /// Grab flag `NVFBC_TODX9VID_NOWAIT`: return the newest frame at once (see the module comment).
@@ -94,7 +101,8 @@ struct CreateParams {
 }
 const _: () = assert!(std::mem::size_of::<CreateParams>() == 512);
 const _: () = assert!(std::mem::offset_of!(CreateParams, device) == 0x10 && std::mem::offset_of!(CreateParams, object) == 0x28);
-const _: () = assert!(std::mem::offset_of!(CreateParams, pid_data) == 0x40 && std::mem::offset_of!(CreateParams, pid_data_size) == 0x48);
+const _: () =
+    assert!(std::mem::offset_of!(CreateParams, pid_data) == 0x40 && std::mem::offset_of!(CreateParams, pid_data_size) == 0x48);
 
 /// `NVFBC_TODX9VID_SETUP_PARAMS_V3`. Offsets from the checks in `NvFBCToDx9Vid_v3::NvFBCToDx9VidSetUp`.
 #[repr(C)]
@@ -118,7 +126,8 @@ struct Dx9SetupParams {
     reserved_ptrs: [*mut c_void; 32],
 }
 const _: () = assert!(std::mem::size_of::<Dx9SetupParams>() == 512);
-const _: () = assert!(std::mem::offset_of!(Dx9SetupParams, buffer_count) == 0xc && std::mem::offset_of!(Dx9SetupParams, buffers) == 0x38);
+const _: () =
+    assert!(std::mem::offset_of!(Dx9SetupParams, buffer_count) == 0xc && std::mem::offset_of!(Dx9SetupParams, buffers) == 0x38);
 
 /// `NVFBC_TODX9VID_OUT_BUF`: a surface per eye; only the first is used.
 #[repr(C)]
@@ -321,8 +330,16 @@ impl Dx9 {
                 adapter,
                 D3DDEVTYPE_HAL,
                 GetDesktopWindow(),
-                (D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE | D3DCREATE_MULTITHREADED | D3DCREATE_NOWINDOWCHANGES)
-                    as u32,
+                // DISABLE_PSGP_THREADING: no driver worker thread. NVIDIA's Direct3D 9 driver
+                // otherwise hands every call to a thread of its own that spins (a `pause` loop)
+                // after each one waiting for the next: measured with xperf, that thread was 3 to
+                // 6% of one logical CPU, most of rbuf's time; with the flag rbuf as a whole
+                // took 1.8%.
+                (D3DCREATE_HARDWARE_VERTEXPROCESSING
+                    | D3DCREATE_FPU_PRESERVE
+                    | D3DCREATE_MULTITHREADED
+                    | D3DCREATE_NOWINDOWCHANGES
+                    | D3DCREATE_DISABLE_PSGP_THREADING) as u32,
                 &mut pp,
                 std::ptr::null_mut(),
                 &mut device,
@@ -377,7 +394,8 @@ fn make_buffers(gpu: &Gpu, dx9: &Dx9, (w, h): (u32, u32)) -> Result<Vec<Buffer>,
             let mut texture = None;
             gpu.device.CreateTexture2D(&desc, None, Some(&mut texture)).map_err(|e| hr(e, "shared texture"))?;
             let texture = texture.ok_or("shared texture: none returned")?;
-            let mut handle: HANDLE = texture.cast::<IDXGIResource>().and_then(|r| r.GetSharedHandle()).map_err(|e| hr(e, "shared handle"))?;
+            let mut handle: HANDLE =
+                texture.cast::<IDXGIResource>().and_then(|r| r.GetSharedHandle()).map_err(|e| hr(e, "shared handle"))?;
             let mut t9 = None;
             dx9.device
                 .CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET as u32, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &mut t9, &mut handle)
@@ -428,12 +446,17 @@ impl Session {
 
     /// Registers `buffers` as the grab targets (again after they are replaced).
     fn setup(&self, buffers: &[Buffer], cursor: bool) -> Result<(), String> {
-        let out: Vec<OutBuffer> =
-            buffers.iter().map(|b| OutBuffer { primary: b.surface.as_raw(), secondary: std::ptr::null_mut() }).collect();
+        let surfaces: Vec<*mut c_void> = buffers.iter().map(|b| b.surface.as_raw()).collect();
+        self.setup_surfaces(&surfaces, MODE_ARGB, cursor)
+    }
+
+    /// Registers Direct3D 9 surfaces of the format `mode` names as the grab targets.
+    fn setup_surfaces(&self, surfaces: &[*mut c_void], mode: u32, cursor: bool) -> Result<(), String> {
+        let out: Vec<OutBuffer> = surfaces.iter().map(|&s| OutBuffer { primary: s, secondary: std::ptr::null_mut() }).collect();
         let mut sp: Dx9SetupParams = unsafe { std::mem::zeroed() };
         sp.version = struct_version(std::mem::size_of::<Dx9SetupParams>(), 3);
         sp.flags = if cursor { SETUP_WITH_CURSOR } else { 0 };
-        sp.mode = MODE_ARGB;
+        sp.mode = mode;
         sp.buffer_count = out.len() as u32;
         sp.buffers = out.as_ptr();
         let setup: unsafe extern "system" fn(*mut c_void, *mut Dx9SetupParams) -> i32 = unsafe { self.slot(SLOT_SETUP) };
@@ -444,16 +467,34 @@ impl Session {
     }
 
     fn grab(&self, index: usize, info: &mut GrabInfo) -> i32 {
+        self.grab_scaled(index, None, info)
+    }
+
+    /// Grabs into buffer `index`, scaled to `target` when given.
+    fn grab_scaled(&self, index: usize, target: Option<(u32, u32)>, info: &mut GrabInfo) -> i32 {
         let mut gp: Dx9GrabParams = unsafe { std::mem::zeroed() };
         gp.version = struct_version(std::mem::size_of::<Dx9GrabParams>(), 1);
         gp.flags = GRAB_NOWAIT;
+        if let Some((w, h)) = target {
+            gp.grab_mode = GRAB_SCALE;
+            gp.target_width = w;
+            gp.target_height = h;
+        } else {
+            gp.grab_mode = GRAB_FULL;
+        }
         gp.buffer_index = index as u32;
         gp.info = info;
         let grab: unsafe extern "system" fn(*mut c_void, *mut Dx9GrabParams) -> i32 = unsafe { self.slot(SLOT_GRAB) };
         unsafe { grab(self.object, &mut gp) }
     }
 
-    fn close(self) {
+    /// Ends the session (dropping it does the same).
+    fn close(self) {}
+}
+
+impl Drop for Session {
+    /// Releases the session, also on an early return, so NvFBC is free for the next client.
+    fn drop(&mut self) {
         unsafe {
             let release: unsafe extern "system" fn(*mut c_void) -> i32 = self.slot(SLOT_RELEASE);
             release(self.object);
@@ -527,7 +568,7 @@ impl NvfbcCapture {
                     return;
                 }
             };
-            let pace = Pace { vblank, interval: 10_000_000 / fps.max(1) as i64 };
+            let pace = Pace::new(vblank, fps);
             run(&g, &dx9, create, source, cursor, first_size, &pace, &latest, &s2, tx);
         });
         match rx.recv() {
@@ -549,10 +590,16 @@ struct Pace {
 }
 
 impl Pace {
+    fn new(vblank: Option<VBlank>, fps: u32) -> Pace {
+        Pace { vblank, interval: 10_000_000 / fps.max(1) as i64 }
+    }
+
     /// Waits for the first vertical blank at or after `due` (less an eighth of a frame for
     /// jitter), or without a usable output, until `due` itself; returns the time. Grabs fall on a
     /// grid of one per output frame, so a 240 Hz display recorded at 60 fps is grabbed on every
-    /// fourth blank: each grab costs the game GPU time, so there are no spare ones.
+    /// fourth blank: each grab costs the game GPU time, so there are no spare ones. (Sleeping
+    /// through the undue blanks on a timer instead saved no measurable CPU time and made some
+    /// grabs late: Windows let the timer overshoot by up to 10 ms with a game in front.)
     fn wait(&self, due: i64) -> i64 {
         loop {
             let ok = match &self.vblank {
@@ -705,6 +752,225 @@ fn run(
     }
 }
 
+/// NvFBC capture straight into NVENC: the driver writes each grab as NV12 into a Direct3D 9
+/// surface NVENC has registered, and the capture thread encodes it right there, on a grid of one
+/// picture per output frame. No conversion pass, no copy, no pacer thread; this is the path
+/// ShadowPlay takes (NvFBC to Direct3D 9, then NVENC).
+pub struct NvfbcEncoder {
+    /// The encoded size.
+    pub size: (u32, u32),
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// What the direct path needs besides the capture source.
+pub struct DirectOptions {
+    pub fps: u32,
+    pub cursor: bool,
+    /// The output size; `None` takes the captured size.
+    pub size: Option<(u32, u32)>,
+    /// Encoder settings for the size the capture turns out to have.
+    pub settings: Box<dyn Fn((u32, u32)) -> Settings + Send>,
+    pub force_key: Arc<AtomicBool>,
+    /// Encoded, repeated (always 0 here: every grab is a new frame), dropped.
+    pub stats: Arc<[AtomicU64; 3]>,
+    pub out: mpsc::Sender<Encoded>,
+}
+
+/// `MAKEFOURCC('N', 'V', '1', '2')`.
+const D3DFMT_NV12: D3DFORMAT = D3DFORMAT(u32::from_le_bytes(*b"NV12"));
+
+fn nv12_surfaces(dx9: &Dx9, (w, h): (u32, u32)) -> Result<Vec<IDirect3DSurface9>, String> {
+    (0..BUFFERS)
+        .map(|_| unsafe {
+            let mut s = None;
+            dx9.device
+                .CreateOffscreenPlainSurface(w, h, D3DFMT_NV12, D3DPOOL_DEFAULT, &mut s, std::ptr::null_mut())
+                .map_err(|e| hr(e, "NV12 surface"))?;
+            s.ok_or_else(|| "NV12 surface: none returned".to_string())
+        })
+        .collect()
+}
+
+impl NvfbcEncoder {
+    pub fn start(gpu: &Gpu, source: Source, vblank: Option<VBlank>, o: DirectOptions) -> Result<NvfbcEncoder, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<Result<(u32, u32), String>>();
+        let (luid, s2) = (gpu.luid, stop.clone());
+        let display = vblank
+            .as_ref()
+            .and_then(|v| unsafe { v.0.GetDesc() }.ok())
+            .map(|d| {
+                let r = d.DesktopCoordinates;
+                ((r.right - r.left) as u32, (r.bottom - r.top) as u32)
+            })
+            .unwrap_or((1920, 1080));
+        let thread = std::thread::spawn(move || {
+            let pace = Pace::new(vblank, o.fps);
+            if let Err(e) = run_direct(luid, source, display, &pace, o, &s2, &tx) {
+                let _ = tx.send(Err(e));
+            }
+        });
+        match rx.recv() {
+            Ok(Ok(size)) => Ok(NvfbcEncoder { size, stop, thread: Some(thread) }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            Err(_) => Err("NvFBC capture thread ended".into()),
+        }
+    }
+}
+
+impl Drop for NvfbcEncoder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The direct capture loop. Returns an error only before the first frame; later failures are
+/// reported and handled in place.
+fn run_direct(
+    luid: LUID,
+    source: Source,
+    display: (u32, u32),
+    pace: &Pace,
+    o: DirectOptions,
+    stop: &AtomicBool,
+    ready: &mpsc::Sender<Result<(u32, u32), String>>,
+) -> Result<(), String> {
+    let m = load_nvfbc()?;
+    let create: CreateEx = unsafe { sym(m, s!("NvFBC_CreateEx"))? };
+    let dx9 = Dx9::new(luid)?;
+
+    // The source size: the display's, or for a process the size of what it presents, read from
+    // a first unscaled grab into surfaces of the display's size. (A scaled grab reports the
+    // target size, so it cannot tell.) A source larger than those surfaces refuses the unscaled
+    // grab; it is then scaled to the display's size.
+    let mut session = Session::open(create, &dx9, source)?;
+    let raw = |v: &[IDirect3DSurface9]| v.iter().map(|s| s.as_raw()).collect::<Vec<_>>();
+    let mut surfaces = nv12_surfaces(&dx9, display)?;
+    session.setup_surfaces(&raw(&surfaces), MODE_NV12, o.cursor)?;
+    let mut info: GrabInfo = unsafe { std::mem::zeroed() };
+    let mut source_size = None;
+    let mut first = -1;
+    for attempt in 0..50 {
+        // Unscaled first; from the tenth failure on, scaled (a source larger than the display).
+        let scale = (attempt >= 10).then_some(display);
+        first = session.grab_scaled(0, scale, &mut info);
+        if first == 0 && info.width > 0 {
+            source_size = scale.is_none().then_some((info.width & !1, info.height & !1));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if first != 0 {
+        return Err(format!("first frame: {}", nvfbc_error(first)));
+    }
+    let size = o.size.or(source_size).unwrap_or(display);
+    if size != display {
+        surfaces = nv12_surfaces(&dx9, size)?;
+        session.setup_surfaces(&raw(&surfaces), MODE_NV12, o.cursor)?;
+    }
+    let settings = (o.settings)(size);
+    let mut enc = Nvenc::new(dx9.device.as_raw(), &raw(&surfaces), &settings, Matrix::Bt601, o.out)?;
+    let _ = ready.send(Ok(size));
+    eprintln!("rbuf: NvFBC is capturing {} (NV12, straight into NVENC)", describe(source));
+
+    let frame = |i: i64| i * 10_000_000 / o.fps.max(1) as i64;
+    let (mut due, mut failures, mut grabs) = (clock::now(), 0, 0u64);
+    let start = due;
+    let mut last_index = -1i64;
+    // Scale only when the source differs from the output (a process at another size, or -s).
+    let mut target = (source_size != Some(size)).then_some(size);
+    while !stop.load(Ordering::Relaxed) {
+        let now = pace.wait(due);
+        due += pace.interval;
+        if now - due > pace.interval {
+            due = now + pace.interval;
+        }
+        // The output frame this grab stands for: the grid point nearest to it.
+        let index = ((now - start) as f64 / pace.interval as f64).round() as i64;
+        let index = index.max(last_index + 1);
+        let Some(slot) = enc.slot(std::time::Duration::ZERO) else {
+            // All surfaces still being encoded: drop this frame rather than wait and fall behind.
+            o.stats[2].fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let mut info: GrabInfo = unsafe { std::mem::zeroed() };
+        let r = session.grab_scaled(slot, target, &mut info);
+        grabs += 1;
+        if r != 0 {
+            enc.release(slot);
+            failures += 1;
+            if failures > 50 {
+                eprintln!("rbuf: NvFBC lost {} ({}); trying again", describe(source), nvfbc_error(r));
+                session.close();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                match Session::open(create, &dx9, source)
+                    .and_then(|s| s.setup_surfaces(&raw(&surfaces), MODE_NV12, o.cursor).map(|_| s))
+                {
+                    Ok(s) => {
+                        session = s;
+                        failures = 0;
+                        eprintln!("rbuf: NvFBC is capturing {} again", describe(source));
+                    }
+                    Err(e) => {
+                        eprintln!("rbuf: NvFBC: {e}");
+                        // Keep a session object to retry with: opening again is the retry.
+                        session = loop {
+                            if stop.load(Ordering::Relaxed) {
+                                return Ok(());
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            if let Ok(s) = Session::open(create, &dx9, source)
+                                .and_then(|s| s.setup_surfaces(&raw(&surfaces), MODE_NV12, o.cursor).map(|_| s))
+                            {
+                                break s;
+                            }
+                        };
+                        failures = 0;
+                    }
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            continue;
+        }
+        failures = 0;
+        let src = (info.width & !1, info.height & !1);
+        if target.is_none() && src.0 > 0 && src != size {
+            // The source changed size (a game switching resolution): scale it to the output
+            // size from now on, and grab this frame again.
+            target = Some(size);
+            enc.release(slot);
+            continue;
+        }
+        last_index = index;
+        let key = o.force_key.swap(false, Ordering::Relaxed);
+        match enc.encode(slot, start + frame(index), frame(index + 1) - frame(index), key) {
+            Ok(()) => {
+                o.stats[0].fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                eprintln!("rbuf: {e}");
+                o.stats[2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if std::env::var_os("RBUF_NVFBC_DEBUG").is_some() {
+        let secs = (clock::now() - start) as f64 / 1e7;
+        eprintln!("NvFBC: {grabs} grabs in {secs:.1} s ({:.1} per second)", grabs as f64 / secs);
+    }
+    // The encoder first (it finishes what is in flight), then the capture session.
+    drop(enc);
+    session.close();
+    Ok(())
+}
+
 impl Drop for NvfbcCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -761,11 +1027,12 @@ pub fn probe() -> Vec<String> {
                 }
                 let r = unsafe { create(&mut p) };
                 let verdict = if r == 0 && !p.object.is_null() {
-                    let s = Session { object: p.object };
+                    // Released by hand: the two interfaces keep Release in different slots.
                     unsafe {
-                        let release: unsafe extern "system" fn(*mut c_void) -> i32 =
-                            s.slot(if kind == INTERFACE_DX9 { SLOT_RELEASE } else { SLOT_SYS_RELEASE });
-                        release(s.object);
+                        let vtable = *(p.object as *const *const *const c_void);
+                        let slot = if kind == INTERFACE_DX9 { SLOT_RELEASE } else { SLOT_SYS_RELEASE };
+                        let release: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*vtable.add(slot));
+                        release(p.object);
                     }
                     format!("ok, up to {}x{}", p.max_width, p.max_height)
                 } else {
